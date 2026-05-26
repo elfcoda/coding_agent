@@ -64,6 +64,8 @@ class CoreAgentManager:
         allowed_project_scopes: list[str] | None = None,
         project_registry: list[Any] | None = None,
         workflow_store: WorkflowStore | None = None,
+        scheduler_reconcile_interval_seconds: float = 3.0,
+        scheduler_max_concurrent_dispatches: int = 4,
     ):
         from nanobot.config.schema import ExecToolConfig
 
@@ -81,7 +83,8 @@ class CoreAgentManager:
         self.project_loops: dict[str, AgentLoop] = {}
         self._running_batch_tasks: dict[str, asyncio.Task[None]] = {}
         self._batch_status: dict[str, dict[str, Any]] = {}
-        self._reconciler_interval_seconds = 3.0
+        self._reconciler_interval_seconds = max(0.2, float(scheduler_reconcile_interval_seconds))
+        self._scheduler_max_concurrent_dispatches = max(1, int(scheduler_max_concurrent_dispatches))
         self._reconciler_task: asyncio.Task[None] | None = None
         self._running_work_item_dispatches: dict[str, asyncio.Task[None]] = {}
         self._scope_exclude_names = {
@@ -616,8 +619,11 @@ class CoreAgentManager:
         ready_items = self.list_work_items(filters={"status": "ready"}, limit=limit)
         started: list[str] = []
         skipped: list[dict[str, str]] = []
+        available_slots = max(0, self._scheduler_max_concurrent_dispatches - len(self._running_work_item_dispatches))
 
         for item in ready_items:
+            if available_slots <= 0:
+                break
             if item.id in self._running_work_item_dispatches:
                 continue
             if item.module not in self._allowed_project_scopes:
@@ -631,6 +637,7 @@ class CoreAgentManager:
             task = asyncio.create_task(self._dispatch_claimed_work_item(claimed.id))
             self._running_work_item_dispatches[claimed.id] = task
             started.append(claimed.id)
+            available_slots -= 1
 
         if started or skipped:
             self._emit_workflow_event(
@@ -638,6 +645,8 @@ class CoreAgentManager:
                 {
                     "started": started,
                     "skipped": skipped,
+                    "max_concurrent_dispatches": self._scheduler_max_concurrent_dispatches,
+                    "running_dispatches": len(self._running_work_item_dispatches),
                 },
             )
 

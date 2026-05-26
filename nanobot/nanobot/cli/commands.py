@@ -362,6 +362,8 @@ def gateway(
         session_manager=session_manager,
         allowed_project_scopes=config.agents.defaults.allowed_project_scopes,
         project_registry=config.agents.defaults.project_registry,
+        scheduler_reconcile_interval_seconds=config.agents.defaults.scheduler.reconcile_interval_seconds,
+        scheduler_max_concurrent_dispatches=config.agents.defaults.scheduler.max_concurrent_dispatches,
     )
 
     # Set cron callback (needs agent)
@@ -468,6 +470,8 @@ def agent(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         allowed_project_scopes=config.agents.defaults.allowed_project_scopes,
         project_registry=config.agents.defaults.project_registry,
+        scheduler_reconcile_interval_seconds=config.agents.defaults.scheduler.reconcile_interval_seconds,
+        scheduler_max_concurrent_dispatches=config.agents.defaults.scheduler.max_concurrent_dispatches,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on

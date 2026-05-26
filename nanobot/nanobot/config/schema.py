@@ -135,6 +135,12 @@ class ProjectScopeConfig(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
 
+class SchedulerConfig(BaseModel):
+    """Workflow reconciler/scheduler runtime controls."""
+    reconcile_interval_seconds: float = 3.0
+    max_concurrent_dispatches: int = 4
+
+
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.nanobot/workspace"
@@ -144,6 +150,7 @@ class AgentDefaults(BaseModel):
     max_tool_iterations: int = 20
     allowed_project_scopes: list[str] = Field(default_factory=list)
     project_registry: list[ProjectScopeConfig] = Field(default_factory=list)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
 
 
 class AgentsConfig(BaseModel):
