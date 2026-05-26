@@ -81,6 +81,9 @@ class CoreAgentManager:
         self.project_loops: dict[str, AgentLoop] = {}
         self._running_batch_tasks: dict[str, asyncio.Task[None]] = {}
         self._batch_status: dict[str, dict[str, Any]] = {}
+        self._reconciler_interval_seconds = 3.0
+        self._reconciler_task: asyncio.Task[None] | None = None
+        self._running_work_item_dispatches: dict[str, asyncio.Task[None]] = {}
         self._scope_exclude_names = {
             ".git",
             ".hg",
@@ -493,6 +496,181 @@ class CoreAgentManager:
         }
         self._emit_workflow_event("workflow.scheduler.tick", summary)
         return summary
+
+    def _next_work_item_metadata(self, work_item: WorkItemRecord, **updates: Any) -> dict[str, Any]:
+        metadata = dict(work_item.metadata)
+        scheduler_meta = dict(metadata.get("scheduler", {}))
+        scheduler_meta.update(updates)
+        metadata["scheduler"] = scheduler_meta
+        return metadata
+
+    async def _dispatch_claimed_work_item(self, work_item_id: str) -> None:
+        """Run one ready work item through the matching module agent."""
+        item = self.get_work_item(work_item_id)
+        if item is None:
+            return
+
+        session_key = item.session_key or f"workflow::{item.id}"
+        try:
+            result = await self.delegate_project_task(
+                project=item.module,
+                task=item.goal,
+                session_key=session_key,
+                channel="workflow",
+                chat_id=f"work_item:{item.id}",
+            )
+            latest = self.get_work_item(work_item_id)
+            if latest is None:
+                return
+
+            artifacts = list(latest.artifacts)
+            artifacts.append(
+                {
+                    "type": "delegation_result",
+                    "work_item_id": latest.id,
+                    "module": latest.module,
+                    "content_preview": result[:2000],
+                }
+            )
+            next_status = "in_progress" if latest.status == "running" else latest.status
+            updated = self.update_work_item(
+                latest.id,
+                {
+                    "status": next_status,
+                    "session_key": session_key,
+                    "artifacts": artifacts,
+                    "metadata": self._next_work_item_metadata(
+                        latest,
+                        last_dispatch_status="ok",
+                        last_dispatch_error="",
+                        last_session_key=session_key,
+                    ),
+                },
+            )
+            self._emit_workflow_event(
+                "workflow.scheduler.dispatched",
+                {
+                    "work_item_id": updated.id,
+                    "module": updated.module,
+                    "status": updated.status,
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            latest = self.get_work_item(work_item_id)
+            if latest is None:
+                return
+
+            fallback_status = "blocked" if latest.status == "running" else latest.status
+            updated = self.update_work_item(
+                latest.id,
+                {
+                    "status": fallback_status,
+                    "metadata": self._next_work_item_metadata(
+                        latest,
+                        last_dispatch_status="error",
+                        last_dispatch_error=str(exc),
+                        last_session_key=session_key,
+                    ),
+                },
+            )
+            self._emit_workflow_event(
+                "workflow.scheduler.dispatch_failed",
+                {
+                    "work_item_id": updated.id,
+                    "module": updated.module,
+                    "status": updated.status,
+                    "error": str(exc),
+                },
+            )
+        finally:
+            self._running_work_item_dispatches.pop(work_item_id, None)
+
+    def _claim_ready_work_item(self, work_item: WorkItemRecord) -> WorkItemRecord | None:
+        """Claim a ready item for dispatch so only one scheduler loop handles it."""
+        current = self.get_work_item(work_item.id)
+        if current is None or current.status != "ready":
+            return None
+
+        session_key = current.session_key or f"workflow::{current.id}"
+        owner = current.owner_agent or f"{current.module}-agent"
+        return self.update_work_item(
+            current.id,
+            {
+                "status": "running",
+                "session_key": session_key,
+                "owner_agent": owner,
+                "metadata": self._next_work_item_metadata(
+                    current,
+                    state="dispatching",
+                    last_dispatch_status="running",
+                    last_dispatch_error="",
+                    last_session_key=session_key,
+                ),
+            },
+        )
+
+    async def _dispatch_ready_work_items(self, limit: int = 100) -> dict[str, Any]:
+        """Claim and dispatch ready work items to module agents."""
+        ready_items = self.list_work_items(filters={"status": "ready"}, limit=limit)
+        started: list[str] = []
+        skipped: list[dict[str, str]] = []
+
+        for item in ready_items:
+            if item.id in self._running_work_item_dispatches:
+                continue
+            if item.module not in self._allowed_project_scopes:
+                skipped.append({"work_item_id": item.id, "reason": "module_not_allowed"})
+                continue
+
+            claimed = self._claim_ready_work_item(item)
+            if claimed is None:
+                continue
+
+            task = asyncio.create_task(self._dispatch_claimed_work_item(claimed.id))
+            self._running_work_item_dispatches[claimed.id] = task
+            started.append(claimed.id)
+
+        if started or skipped:
+            self._emit_workflow_event(
+                "workflow.scheduler.dispatch_cycle",
+                {
+                    "started": started,
+                    "skipped": skipped,
+                },
+            )
+
+        return {"started": started, "skipped": skipped}
+
+    async def _run_reconciler_loop(self) -> None:
+        """Continuously reconcile workflow state and dispatch ready work items."""
+        try:
+            while True:
+                self.run_workflow_scheduler_tick(limit=300)
+                await self._dispatch_ready_work_items(limit=150)
+                await asyncio.sleep(self._reconciler_interval_seconds)
+        except asyncio.CancelledError:
+            raise
+
+    async def _start_reconciler(self) -> None:
+        if self._reconciler_task is not None and not self._reconciler_task.done():
+            return
+        self._reconciler_task = asyncio.create_task(self._run_reconciler_loop())
+
+    async def _stop_reconciler(self) -> None:
+        task = self._reconciler_task
+        self._reconciler_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        dispatch_tasks = list(self._running_work_item_dispatches.values())
+        self._running_work_item_dispatches.clear()
+        for dispatch_task in dispatch_tasks:
+            dispatch_task.cancel()
+        if dispatch_tasks:
+            await asyncio.gather(*dispatch_tasks, return_exceptions=True)
 
     def _serialize_workflow_record(self, record: Any) -> dict[str, Any]:
         return asdict(record)
@@ -1062,10 +1240,20 @@ class CoreAgentManager:
 
     async def run(self) -> None:
         """Run the core agent loop against the shared message bus."""
-        await self.core_loop.run()
+        await self._start_reconciler()
+        try:
+            await self.core_loop.run()
+        finally:
+            await self._stop_reconciler()
 
     def stop(self) -> None:
         """Stop the core loop."""
+        if self._reconciler_task is not None:
+            self._reconciler_task.cancel()
+            self._reconciler_task = None
+        for dispatch_task in list(self._running_work_item_dispatches.values()):
+            dispatch_task.cancel()
+        self._running_work_item_dispatches.clear()
         self.core_loop.stop()
 
     async def process_direct(

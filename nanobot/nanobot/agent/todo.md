@@ -83,5 +83,5 @@ Module
 建议的落地顺序
 
 
-加一个 reconciler/scheduler，持续把 ready 任务派给对应 module agent。
+
 最后再做版本失效传播和重验证。
