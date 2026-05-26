@@ -32,12 +32,12 @@ class ManageWorkflowStateTool(Tool):
             "properties": {
                 "entity": {
                     "type": "string",
-                    "enum": ["work_item", "contract", "dependency_edge", "decision"],
+                    "enum": ["work_item", "contract", "dependency_edge", "decision", "scheduler"],
                     "description": "Workflow entity type to manage",
                 },
                 "action": {
                     "type": "string",
-                    "enum": ["create", "get", "list", "update", "delete"],
+                    "enum": ["create", "get", "list", "update", "delete", "tick"],
                     "description": "Operation to perform on the workflow entity",
                 },
                 "record_id": {

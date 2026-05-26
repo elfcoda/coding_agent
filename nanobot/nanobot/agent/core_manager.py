@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -14,8 +15,9 @@ from nanobot.agent.tools.batch_delegate import DelegateProjectsBatchTool
 from nanobot.agent.tools.batch_status import GetBatchDelegationStatusTool
 from nanobot.agent.tools.delegate import DelegateProjectTaskTool
 from nanobot.agent.tools.list_project_scopes import ListProjectScopesTool
+from nanobot.agent.tools.request_contract_stub import RequestContractStubTool
 from nanobot.agent.tools.workflow_state import ManageWorkflowStateTool
-from nanobot.bus.events import InboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.loader import get_data_dir
 from nanobot.providers.base import LLMProvider
@@ -118,7 +120,379 @@ class CoreAgentManager:
         self.core_loop.tools.register(DelegateProjectsBatchTool(self))
         self.core_loop.tools.register(GetBatchDelegationStatusTool(self))
         self.core_loop.tools.register(ListProjectScopesTool(self))
+        self.core_loop.tools.register(RequestContractStubTool(self))
         self.core_loop.tools.register(ManageWorkflowStateTool(self))
+
+    @staticmethod
+    def _to_snake_case(value: str) -> str:
+        value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+        value = re.sub(r"[^a-zA-Z0-9]+", "_", value)
+        return value.strip("_").lower() or "contract"
+
+    def _resolve_scope_file_path(self, scope_path: Path, relative_path: str) -> Path:
+        target = (scope_path / relative_path).resolve()
+        try:
+            within_scope = target.is_relative_to(scope_path)
+        except AttributeError:
+            within_scope = str(target).startswith(str(scope_path))
+
+        if not within_scope:
+            raise ValueError("stub_relative_path must stay within the consumer project scope")
+        return target
+
+    def request_contract_stub(
+        self,
+        consumer_project: str,
+        provider_project: str,
+        interface_name: str,
+        contract_spec: dict[str, Any] | None = None,
+        stub_relative_path: str | None = None,
+        stub_content: str | None = None,
+        consumer_work_item_id: str | None = None,
+        provider_work_item_id: str | None = None,
+    ) -> str:
+        """Create a contract request and caller-side stub without asking provider to fully implement."""
+        interface_name = interface_name.strip()
+        if not interface_name:
+            raise ValueError("interface_name cannot be empty")
+
+        consumer_normalized, consumer_scope_path = self._normalize_project(consumer_project)
+        provider_normalized, _ = self._normalize_project(provider_project)
+
+        spec = contract_spec or {}
+        relative_path = (stub_relative_path or f"contracts/{self._to_snake_case(interface_name)}_stub.py").strip().replace("\\", "/")
+        if not relative_path:
+            raise ValueError("stub_relative_path cannot be empty")
+
+        consumer_linked_work_item = (consumer_work_item_id or "").strip()
+        if not consumer_linked_work_item:
+            candidate = self._find_latest_work_item_for_module(consumer_normalized)
+            if candidate:
+                consumer_linked_work_item = candidate.id
+        if not consumer_linked_work_item:
+            created_work_item = self.create_work_item(
+                {
+                    "module": consumer_normalized,
+                    "goal": f"Integrate cross-module contract stub for {interface_name}",
+                    "status": "blocked",
+                    "owner_agent": f"{consumer_normalized}-agent",
+                    "decision_required": False,
+                    "decision_type": "",
+                    "metadata": {
+                        "flow": "contract_request_stub_only",
+                        "interface_name": interface_name,
+                        "provider_module": provider_normalized,
+                    },
+                }
+            )
+            consumer_linked_work_item = created_work_item.id
+
+        provider_linked_work_item = (provider_work_item_id or "").strip()
+        if not provider_linked_work_item:
+            candidate = self._find_latest_work_item_for_module(provider_normalized)
+            if candidate:
+                provider_linked_work_item = candidate.id
+        if not provider_linked_work_item:
+            created_provider_item = self.create_work_item(
+                {
+                    "module": provider_normalized,
+                    "goal": f"Review and implement contract {interface_name} for {consumer_normalized}",
+                    "status": "requested",
+                    "owner_agent": f"{provider_normalized}-agent",
+                    "decision_required": False,
+                    "decision_type": "",
+                    "metadata": {
+                        "flow": "contract_request_stub_only",
+                        "interface_name": interface_name,
+                        "consumer_module": consumer_normalized,
+                    },
+                }
+            )
+            provider_linked_work_item = created_provider_item.id
+
+        stub_path = self._resolve_scope_file_path(consumer_scope_path, relative_path)
+        stub_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not stub_content:
+            spec_json = json.dumps(spec, ensure_ascii=False, indent=2)
+            stub_content = (
+                f"\"\"Auto-generated contract stub for '{interface_name}'.\"\"\"\n\n"
+                "from __future__ import annotations\n\n"
+                "from typing import Any\n\n"
+                f"CONTRACT_PROVIDER = \"{provider_normalized}\"\n"
+                f"CONTRACT_INTERFACE = \"{interface_name}\"\n"
+                f"CONTRACT_SPEC = {spec_json}\n\n"
+                f"class {interface_name}Stub:\n"
+                "    \"\"\"Caller-side stub that unblocks consumer work before provider implementation.\"\"\"\n\n"
+                "    def invoke(self, payload: dict[str, Any]) -> dict[str, Any]:\n"
+                "        raise NotImplementedError(\n"
+                "            \"Contract requested from provider module; implementation pending. \"\n"
+                "            \"Replace this stub once provider contract is accepted and implemented.\"\n"
+                "        )\n"
+            )
+
+        stub_path.write_text(stub_content, encoding="utf-8")
+        contract = self.create_contract(
+            {
+                "provider_module": provider_normalized,
+                "consumer_module": consumer_normalized,
+                "interface_name": interface_name,
+                "status": "requested",
+                "spec": spec,
+                "stub_path": f"{consumer_normalized}/{relative_path}" if not relative_path.startswith(consumer_normalized + "/") else relative_path,
+                "work_item_id": consumer_linked_work_item,
+                "consumer_work_item_id": consumer_linked_work_item,
+                "provider_work_item_id": provider_linked_work_item,
+                "metadata": {
+                    "flow": "contract_request_stub_only",
+                    "stub_path": str(stub_path),
+                },
+            }
+        )
+
+        self._emit_workflow_event(
+            "workflow.stub.generated",
+            {
+                "contract_id": contract.id,
+                "consumer_project": consumer_normalized,
+                "provider_project": provider_normalized,
+                "interface_name": interface_name,
+                "stub_path": str(stub_path),
+            },
+        )
+        self._emit_workflow_event(
+            "contract.requested_for_provider",
+            {
+                "contract_id": contract.id,
+                "interface_name": interface_name,
+                "consumer_project": consumer_normalized,
+                "provider_project": provider_normalized,
+                "consumer_work_item_id": consumer_linked_work_item,
+                "provider_work_item_id": provider_linked_work_item,
+                "stub_path": str(stub_path),
+                "status": "requested",
+            },
+        )
+        return (
+            f"Contract request created: {contract.id} ({consumer_normalized} -> {provider_normalized}, interface={interface_name}). "
+            f"Caller-side stub generated at {stub_path}. "
+            f"Provider work item linked: {provider_linked_work_item}. No provider implementation was requested."
+        )
+
+    def _emit_workflow_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Emit workflow events to the bus so UI/schedulers can react in real time."""
+        message = {
+            "type": event_type,
+            "payload": payload,
+        }
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        loop.create_task(
+            self.bus.publish_outbound(
+                msg=OutboundMessage(
+                    channel="workflow",
+                    chat_id="orchestrator",
+                    content=json.dumps(message, ensure_ascii=False),
+                    metadata={"event_type": event_type, **payload},
+                )
+            )
+        )
+
+    @staticmethod
+    def _unique_list(values: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        return result
+
+    def _find_latest_work_item_for_module(self, module: str) -> WorkItemRecord | None:
+        items = self.list_work_items(filters={"module": module}, limit=50)
+        for item in items:
+            if item.status not in {"completed", "done", "cancelled"}:
+                return item
+        return items[0] if items else None
+
+    def _sync_contract_blocking(self, contract: ContractRecord) -> None:
+        """Apply contract status to any linked work items that reference it as blocker."""
+        resolved = contract.status in {"accepted", "implemented", "completed"}
+        work_items = self.list_work_items(limit=500)
+        for work_item in work_items:
+            if contract.id not in work_item.blocked_by:
+                continue
+
+            next_blocked = [entry for entry in work_item.blocked_by if entry != contract.id] if resolved else list(work_item.blocked_by)
+            updates: dict[str, Any] = {"blocked_by": next_blocked}
+            if resolved and work_item.status == "blocked" and not next_blocked:
+                updates["status"] = "ready"
+            if not resolved and work_item.status not in {"waiting_decision", "blocked"}:
+                updates["status"] = "blocked"
+
+            updated = self.update_work_item(work_item.id, updates)
+            self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(updated))
+
+    def _apply_contract_side_effects(self, contract: ContractRecord, fields: dict[str, Any]) -> None:
+        """Auto-link contract lifecycle with dependency edges and work item blockers."""
+        auto_edge = bool(fields.get("auto_create_dependency_edge", True))
+        consumer_work_item_id = str(fields.get("consumer_work_item_id") or contract.work_item_id or "")
+        if not consumer_work_item_id:
+            candidate = self._find_latest_work_item_for_module(contract.consumer_module)
+            consumer_work_item_id = candidate.id if candidate else ""
+
+        # Always attach contract blocker to consumer work item for scheduler visibility.
+        if consumer_work_item_id:
+            consumer_item = self.get_work_item(consumer_work_item_id)
+            if consumer_item:
+                next_blocked_by = self._unique_list(list(consumer_item.blocked_by) + [contract.id])
+                updates: dict[str, Any] = {
+                    "blocked_by": next_blocked_by,
+                }
+                if contract.status not in {"accepted", "implemented", "completed"} and consumer_item.status not in {"blocked", "waiting_decision"}:
+                    updates["status"] = "blocked"
+                updated = self.update_work_item(consumer_work_item_id, updates)
+                self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(updated))
+
+        if auto_edge:
+            provider_work_item_id = str(fields.get("provider_work_item_id") or "")
+
+            if not provider_work_item_id:
+                candidate = self._find_latest_work_item_for_module(contract.provider_module)
+                provider_work_item_id = candidate.id if candidate else ""
+
+            if consumer_work_item_id and provider_work_item_id:
+                existing_edges = self.list_dependency_edges(
+                    filters={
+                        "source_work_item_id": consumer_work_item_id,
+                        "target_work_item_id": provider_work_item_id,
+                        "edge_type": "requires_contract",
+                    },
+                    limit=1,
+                )
+                if existing_edges:
+                    edge = self.update_dependency_edge(
+                        existing_edges[0].id,
+                        {
+                            "status": "active",
+                            "metadata": {**existing_edges[0].metadata, "contract_id": contract.id},
+                        },
+                    )
+                else:
+                    edge = self.create_dependency_edge(
+                        {
+                            "source_work_item_id": consumer_work_item_id,
+                            "target_work_item_id": provider_work_item_id,
+                            "edge_type": "requires_contract",
+                            "status": "active",
+                            "metadata": {"contract_id": contract.id},
+                        }
+                    )
+                self._emit_workflow_event("workflow.dependency_edge.upserted", self._serialize_workflow_record(edge))
+
+                consumer_item = self.get_work_item(consumer_work_item_id)
+                if consumer_item:
+                    next_depends_on = self._unique_list(list(consumer_item.depends_on) + [provider_work_item_id])
+                    updates: dict[str, Any] = {
+                        "depends_on": next_depends_on,
+                    }
+                    if contract.status not in {"accepted", "implemented", "completed"} and consumer_item.status not in {"blocked", "waiting_decision"}:
+                        updates["status"] = "blocked"
+                    updated = self.update_work_item(consumer_work_item_id, updates)
+                    self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(updated))
+
+        self._sync_contract_blocking(contract)
+
+    def _apply_decision_side_effects(self, decision: DecisionRecord) -> None:
+        """Update work item lifecycle automatically when decisions complete."""
+        if decision.status not in {"approved", "rejected", "completed"}:
+            return
+
+        work_item = self.get_work_item(decision.work_item_id)
+        if not work_item:
+            return
+
+        updates: dict[str, Any] = {
+            "decision_required": False,
+        }
+        if work_item.decision_type == decision.decision_type:
+            updates["decision_type"] = ""
+
+        if decision.status in {"approved", "completed"}:
+            if work_item.status in {"waiting_decision", "proposed", "blocked"} and not work_item.blocked_by:
+                updates["status"] = "ready"
+        elif decision.status == "rejected":
+            updates["status"] = "blocked"
+
+        updated = self.update_work_item(work_item.id, updates)
+        self._emit_workflow_event(
+            "workflow.decision.applied",
+            {
+                "decision": self._serialize_workflow_record(decision),
+                "work_item": self._serialize_workflow_record(updated),
+            },
+        )
+
+    def run_workflow_scheduler_tick(self, limit: int = 200) -> dict[str, Any]:
+        """Reconcile workflow state and return transitions for UI/scheduler loops."""
+        work_items = self.list_work_items(limit=limit)
+        transitions: list[dict[str, Any]] = []
+
+        for work_item in work_items:
+            blockers: list[str] = []
+            decisions = self.list_decisions(filters={"work_item_id": work_item.id}, limit=100)
+            if any(decision.status in {"pending", "in_review"} for decision in decisions):
+                blockers.append("pending_decision")
+
+            edges = self.list_dependency_edges(filters={"source_work_item_id": work_item.id, "status": "active"}, limit=100)
+            for edge in edges:
+                target = self.get_work_item(edge.target_work_item_id)
+                if target and target.status not in {"completed", "done", "cancelled"}:
+                    blockers.append(f"dependency:{edge.id}")
+
+            unresolved_contracts = []
+            for contract_id in work_item.blocked_by:
+                contract = self.get_contract(contract_id)
+                if contract and contract.status not in {"accepted", "implemented", "completed"}:
+                    unresolved_contracts.append(contract_id)
+            blockers.extend([f"contract:{item}" for item in unresolved_contracts])
+
+            desired_status = work_item.status
+            desired_decision_required = any(decision.status in {"pending", "in_review"} for decision in decisions)
+            if desired_decision_required:
+                desired_status = "waiting_decision"
+            elif blockers:
+                desired_status = "blocked"
+            elif work_item.status in {"proposed", "blocked", "waiting_decision"}:
+                desired_status = "ready"
+
+            if desired_status != work_item.status or desired_decision_required != work_item.decision_required:
+                updated = self.update_work_item(
+                    work_item.id,
+                    {
+                        "status": desired_status,
+                        "decision_required": desired_decision_required,
+                    },
+                )
+                transition = {
+                    "work_item_id": work_item.id,
+                    "from_status": work_item.status,
+                    "to_status": updated.status,
+                    "blockers": blockers,
+                }
+                transitions.append(transition)
+                self._emit_workflow_event("workflow.scheduler.transition", transition)
+
+        summary = {
+            "checked": len(work_items),
+            "transitions": transitions,
+        }
+        self._emit_workflow_event("workflow.scheduler.tick", summary)
+        return summary
 
     def _serialize_workflow_record(self, record: Any) -> dict[str, Any]:
         return asdict(record)
@@ -139,7 +513,9 @@ class CoreAgentManager:
             artifacts=list(fields.get("artifacts", [])),
             metadata=dict(fields.get("metadata", {})),
         )
-        return self.workflow_store.create_work_item(record)
+        created = self.workflow_store.create_work_item(record)
+        self._emit_workflow_event("workflow.work_item.created", self._serialize_workflow_record(created))
+        return created
 
     def get_work_item(self, record_id: str) -> WorkItemRecord | None:
         return self.workflow_store.get_work_item(record_id)
@@ -155,10 +531,14 @@ class CoreAgentManager:
         )
 
     def update_work_item(self, record_id: str, changes: dict[str, Any]) -> WorkItemRecord:
-        return self.workflow_store.update_work_item(record_id, **changes)
+        updated = self.workflow_store.update_work_item(record_id, **changes)
+        self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(updated))
+        return updated
 
     def delete_work_item(self, record_id: str) -> bool:
-        return self.workflow_store.delete_work_item(record_id)
+        deleted = self.workflow_store.delete_work_item(record_id)
+        self._emit_workflow_event("workflow.work_item.deleted", {"id": record_id, "deleted": deleted})
+        return deleted
 
     def create_contract(self, fields: dict[str, Any]) -> ContractRecord:
         record = ContractRecord(
@@ -174,7 +554,10 @@ class CoreAgentManager:
             work_item_id=str(fields.get("work_item_id", "")),
             metadata=dict(fields.get("metadata", {})),
         )
-        return self.workflow_store.create_contract(record)
+        created = self.workflow_store.create_contract(record)
+        self._emit_workflow_event("workflow.contract.created", self._serialize_workflow_record(created))
+        self._apply_contract_side_effects(created, fields)
+        return created
 
     def get_contract(self, record_id: str) -> ContractRecord | None:
         return self.workflow_store.get_contract(record_id)
@@ -191,10 +574,15 @@ class CoreAgentManager:
         )
 
     def update_contract(self, record_id: str, changes: dict[str, Any]) -> ContractRecord:
-        return self.workflow_store.update_contract(record_id, **changes)
+        updated = self.workflow_store.update_contract(record_id, **changes)
+        self._emit_workflow_event("workflow.contract.updated", self._serialize_workflow_record(updated))
+        self._apply_contract_side_effects(updated, changes)
+        return updated
 
     def delete_contract(self, record_id: str) -> bool:
-        return self.workflow_store.delete_contract(record_id)
+        deleted = self.workflow_store.delete_contract(record_id)
+        self._emit_workflow_event("workflow.contract.deleted", {"id": record_id, "deleted": deleted})
+        return deleted
 
     def create_dependency_edge(self, fields: dict[str, Any]) -> DependencyEdgeRecord:
         record = DependencyEdgeRecord(
@@ -205,7 +593,9 @@ class CoreAgentManager:
             status=str(fields.get("status", "active")),
             metadata=dict(fields.get("metadata", {})),
         )
-        return self.workflow_store.create_dependency_edge(record)
+        created = self.workflow_store.create_dependency_edge(record)
+        self._emit_workflow_event("workflow.dependency_edge.created", self._serialize_workflow_record(created))
+        return created
 
     def get_dependency_edge(self, record_id: str) -> DependencyEdgeRecord | None:
         return self.workflow_store.get_dependency_edge(record_id)
@@ -221,10 +611,14 @@ class CoreAgentManager:
         )
 
     def update_dependency_edge(self, record_id: str, changes: dict[str, Any]) -> DependencyEdgeRecord:
-        return self.workflow_store.update_dependency_edge(record_id, **changes)
+        updated = self.workflow_store.update_dependency_edge(record_id, **changes)
+        self._emit_workflow_event("workflow.dependency_edge.updated", self._serialize_workflow_record(updated))
+        return updated
 
     def delete_dependency_edge(self, record_id: str) -> bool:
-        return self.workflow_store.delete_dependency_edge(record_id)
+        deleted = self.workflow_store.delete_dependency_edge(record_id)
+        self._emit_workflow_event("workflow.dependency_edge.deleted", {"id": record_id, "deleted": deleted})
+        return deleted
 
     def create_decision(self, fields: dict[str, Any]) -> DecisionRecord:
         record = DecisionRecord(
@@ -238,7 +632,10 @@ class CoreAgentManager:
             rationale=str(fields.get("rationale", "")),
             metadata=dict(fields.get("metadata", {})),
         )
-        return self.workflow_store.create_decision(record)
+        created = self.workflow_store.create_decision(record)
+        self._emit_workflow_event("workflow.decision.created", self._serialize_workflow_record(created))
+        self._apply_decision_side_effects(created)
+        return created
 
     def get_decision(self, record_id: str) -> DecisionRecord | None:
         return self.workflow_store.get_decision(record_id)
@@ -254,10 +651,15 @@ class CoreAgentManager:
         )
 
     def update_decision(self, record_id: str, changes: dict[str, Any]) -> DecisionRecord:
-        return self.workflow_store.update_decision(record_id, **changes)
+        updated = self.workflow_store.update_decision(record_id, **changes)
+        self._emit_workflow_event("workflow.decision.updated", self._serialize_workflow_record(updated))
+        self._apply_decision_side_effects(updated)
+        return updated
 
     def delete_decision(self, record_id: str) -> bool:
-        return self.workflow_store.delete_decision(record_id)
+        deleted = self.workflow_store.delete_decision(record_id)
+        self._emit_workflow_event("workflow.decision.deleted", {"id": record_id, "deleted": deleted})
+        return deleted
 
     def manage_workflow_state(
         self,
@@ -270,6 +672,11 @@ class CoreAgentManager:
     ) -> str:
         fields = fields or {}
         filters = filters or {}
+        if entity == "scheduler":
+            if action != "tick":
+                raise ValueError("scheduler entity only supports 'tick' action")
+            return json.dumps(self.run_workflow_scheduler_tick(limit=limit), ensure_ascii=False, indent=2)
+
         entity_map = {
             "work_item": (self.create_work_item, self.get_work_item, self.list_work_items, self.update_work_item, self.delete_work_item),
             "contract": (self.create_contract, self.get_contract, self.list_contracts, self.update_contract, self.delete_contract),

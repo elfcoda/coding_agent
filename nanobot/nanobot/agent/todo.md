@@ -80,4 +80,8 @@ Module
 
 
 
-这是我真正用的前端代码：D:\code\vueflow\src，改的使用vueflow做蓝图的，而不是用nanobot的前端。以适应这种ai coding范式
+建议的落地顺序
+
+
+加一个 reconciler/scheduler，持续把 ready 任务派给对应 module agent。
+最后再做版本失效传播和重验证。

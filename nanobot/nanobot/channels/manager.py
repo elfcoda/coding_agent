@@ -129,6 +129,21 @@ class ChannelManager:
                 logger.info("QQ channel enabled")
             except ImportError as e:
                 logger.warning(f"QQ channel not available: {e}")
+
+        # Workflow WS channel (for orchestration UI)
+        if self.config.channels.workflow_ws.enabled:
+            try:
+                from nanobot.channels.workflow_ws import WorkflowWSChannel
+                self.channels["workflow"] = WorkflowWSChannel(
+                    self.config.channels.workflow_ws,
+                    self.bus,
+                )
+                logger.info(
+                    "Workflow WS channel enabled "
+                    f"(ws://{self.config.channels.workflow_ws.host}:{self.config.channels.workflow_ws.port}{self.config.channels.workflow_ws.path})"
+                )
+            except ImportError as e:
+                logger.warning(f"Workflow WS channel not available: {e}")
     
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
         """Start a channel and log any exceptions."""
