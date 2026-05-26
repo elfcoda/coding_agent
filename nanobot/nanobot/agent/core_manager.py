@@ -398,18 +398,8 @@ class CoreAgentManager:
                             "metadata": {"contract_id": contract.id},
                         }
                     )
+                # 已经移除业务路径里的 depends_on 双写，单一来源于 dependency_edges
                 self._emit_workflow_event("workflow.dependency_edge.upserted", self._serialize_workflow_record(edge))
-
-                consumer_item = self.get_work_item(consumer_work_item_id)
-                if consumer_item:
-                    next_depends_on = self._unique_list(list(consumer_item.depends_on) + [provider_work_item_id])
-                    updates: dict[str, Any] = {
-                        "depends_on": next_depends_on,
-                    }
-                    if contract.status not in {"accepted", "implemented", "completed"} and consumer_item.status not in {"blocked", "waiting_decision"}:
-                        updates["status"] = "blocked"
-                    updated = self.update_work_item(consumer_work_item_id, updates)
-                    self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(updated))
 
         self._sync_contract_blocking(contract)
 
@@ -459,6 +449,21 @@ class CoreAgentManager:
                 target = self.get_work_item(edge.target_work_item_id)
                 if target and target.status not in {"completed", "done", "cancelled"}:
                     blockers.append(f"dependency:{edge.id}")
+
+            # Single source of truth: dependency_edges. WorkItem.depends_on is a scheduler-maintained projection.
+            # 不一致才回写，避免无意义抖动写库
+            # 依赖只写 edge，depends_on 由 scheduler 自动投影修复。
+            desired_depends_on = sorted({edge.target_work_item_id for edge in edges})
+            current_depends_on = sorted({str(item) for item in work_item.depends_on})
+            if desired_depends_on != current_depends_on:
+                projected = self.update_work_item(
+                    work_item.id,
+                    {
+                        "depends_on": desired_depends_on,
+                    },
+                )
+                work_item = projected
+                self._emit_workflow_event("workflow.work_item.dependencies_projected", self._serialize_workflow_record(projected))
 
             unresolved_contracts = []
             for contract_id in work_item.blocked_by:
