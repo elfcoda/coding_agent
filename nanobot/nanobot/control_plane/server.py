@@ -56,6 +56,44 @@ class ProjectAttributesRequest(BaseModel):
     attributes: dict[str, Any] = Field(default_factory=dict)
 
 
+class CreateWorkItemCommandRequest(BaseModel):
+    """Direct command for creating a work item."""
+
+    module: str
+    goal: str
+    status: str = "proposed"
+    priority: int = 0
+    owner_agent: str = ""
+    session_key: str = ""
+    decision_required: bool = False
+    decision_type: str = ""
+    depends_on: list[str] = Field(default_factory=list)
+    blocked_by: list[str] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class UpdateWorkItemStatusCommandRequest(BaseModel):
+    """Direct command for updating one work item status."""
+
+    status: str
+    metadata_patch: dict[str, Any] = Field(default_factory=dict)
+
+
+class SubmitDecisionCommandRequest(BaseModel):
+    """Direct command for submitting a decision (create or update)."""
+
+    decision_id: str | None = None
+    work_item_id: str
+    decision_type: str
+    status: str = "approved"
+    options: list[dict[str, Any]] = Field(default_factory=list)
+    chosen_option: str = ""
+    decider: str = "human"
+    rationale: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 def _json_or_text(value: str) -> Any:
     try:
         return json.loads(value)
@@ -110,6 +148,72 @@ def create_control_plane_app(manager: CoreAgentManager) -> FastAPI:
             return {
                 "ok": True,
                 "result": _json_or_text(result),
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/control/commands/work-items/create")
+    async def command_create_work_item(request: CreateWorkItemCommandRequest) -> dict[str, Any]:
+        try:
+            created = manager.create_work_item(request.model_dump())
+            return {
+                "ok": True,
+                "work_item": asdict(created),
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/control/commands/work-items/{work_item_id}/status")
+    async def command_update_work_item_status(
+        work_item_id: str,
+        request: UpdateWorkItemStatusCommandRequest,
+    ) -> dict[str, Any]:
+        try:
+            current = manager.get_work_item(work_item_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail=f"Unknown work item id: {work_item_id}")
+
+            next_metadata = {**dict(current.metadata), **dict(request.metadata_patch)}
+            updated = manager.update_work_item(
+                work_item_id,
+                {
+                    "status": request.status,
+                    "metadata": next_metadata,
+                },
+            )
+            return {
+                "ok": True,
+                "work_item": asdict(updated),
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/control/commands/decisions/submit")
+    async def command_submit_decision(request: SubmitDecisionCommandRequest) -> dict[str, Any]:
+        payload = {
+            "work_item_id": request.work_item_id,
+            "decision_type": request.decision_type,
+            "status": request.status,
+            "options": request.options,
+            "chosen_option": request.chosen_option,
+            "decider": request.decider,
+            "rationale": request.rationale,
+            "metadata": request.metadata,
+        }
+        try:
+            if request.decision_id:
+                updated = manager.update_decision(request.decision_id, payload)
+                return {
+                    "ok": True,
+                    "decision": asdict(updated),
+                }
+
+            created = manager.create_decision(payload)
+            return {
+                "ok": True,
+                "decision": asdict(created),
             }
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -214,6 +318,18 @@ def create_control_plane_app(manager: CoreAgentManager) -> FastAPI:
 
     @app.put("/api/control/projects/{project}/attributes")
     async def set_project_attributes(project: str, request: ProjectAttributesRequest) -> dict[str, Any]:
+        try:
+            updated = manager.set_project_runtime_attributes(project, request.attributes)
+            return {
+                "ok": True,
+                "project": project,
+                "attributes": updated,
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/api/control/commands/projects/{project}/attributes")
+    async def command_set_project_attributes(project: str, request: ProjectAttributesRequest) -> dict[str, Any]:
         try:
             updated = manager.set_project_runtime_attributes(project, request.attributes)
             return {
