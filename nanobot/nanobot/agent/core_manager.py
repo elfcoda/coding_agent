@@ -376,6 +376,7 @@ class CoreAgentManager:
         )
         merged_consumer_work_item_ids = self._unique_list(
             [str(item).strip() for item in metadata.get("merged_consumer_work_item_ids", []) if str(item).strip()]
+            + ([existing.work_item_id] if str(existing.work_item_id).strip() else [])
             + ([incoming_consumer_work_item_id] if incoming_consumer_work_item_id else [])
         )
         merged_provider_work_item_ids = self._unique_list(
@@ -1100,23 +1101,43 @@ class CoreAgentManager:
     async def _dispatch_ready_work_items(self, limit: int = 100) -> dict[str, Any]:
         """Claim and dispatch ready work items to module agents."""
         ready_items = self.list_work_items(filters={"status": "ready"}, limit=limit)
+        plan = self._build_dispatch_plan(ready_items)
         started: list[str] = []
         skipped: list[dict[str, str]] = []
+        selected: list[dict[str, Any]] = []
         available_slots = max(0, self._scheduler_max_concurrent_dispatches - len(self._running_work_item_dispatches))
 
-        for item in ready_items:
+        for entry in plan:
             if available_slots <= 0:
                 break
-            if item.id in self._running_work_item_dispatches:
+            item = self.get_work_item(entry["work_item_id"])
+            if item is None:
                 continue
-            if item.module not in self._allowed_project_scopes:
-                skipped.append({"work_item_id": item.id, "reason": "module_not_allowed"})
+            if item.id in self._running_work_item_dispatches:
+                skipped.append({"work_item_id": item.id, "reason": "already_running"})
+                continue
+            profile = entry["profile"]
+            current_inflight = self._module_inflight_count(item.module)
+            cap = int(profile["concurrency_cap"])
+            if current_inflight >= cap:
+                skipped.append({"work_item_id": item.id, "reason": "module_concurrency_cap_reached"})
                 continue
 
             claimed = self._claim_ready_work_item(item)
             if claimed is None:
+                skipped.append({"work_item_id": item.id, "reason": "claim_failed"})
                 continue
 
+            selected.append(
+                {
+                    "work_item_id": claimed.id,
+                    "module": claimed.module,
+                    "score": entry["score"],
+                    "priority": claimed.priority,
+                    "priority_bias": entry["priority_bias"],
+                    "concurrency_cap": cap,
+                }
+            )
             task = asyncio.create_task(self._dispatch_claimed_work_item(claimed.id))
             self._running_work_item_dispatches[claimed.id] = task
             started.append(claimed.id)
@@ -1126,10 +1147,30 @@ class CoreAgentManager:
             self._emit_workflow_event(
                 "workflow.scheduler.dispatch_cycle",
                 {
+                    "selected": selected,
                     "started": started,
                     "skipped": skipped,
                     "max_concurrent_dispatches": self._scheduler_max_concurrent_dispatches,
                     "running_dispatches": len(self._running_work_item_dispatches),
+                },
+            )
+
+        if plan:
+            self._emit_workflow_event(
+                "workflow.scheduler.dispatch_plan",
+                {
+                    "ready_count": len(ready_items),
+                    "plan": [
+                        {
+                            "work_item_id": entry["work_item_id"],
+                            "module": entry["module"],
+                            "score": entry["score"],
+                            "priority": entry["priority"],
+                            "priority_bias": entry["priority_bias"],
+                            "concurrency_cap": entry["concurrency_cap"],
+                        }
+                        for entry in plan
+                    ],
                 },
             )
 
@@ -1223,6 +1264,16 @@ class CoreAgentManager:
             # 审计更清晰，可以追踪“谁的请求被合并进来了（由audit实现）。
             return self._merge_contract_request(existing, fields)
 
+        work_item_id = str(fields.get("work_item_id", "")).strip()
+        consumer_work_item_id = str(fields.get("consumer_work_item_id", "")).strip() or work_item_id
+        provider_work_item_id = str(fields.get("provider_work_item_id", "")).strip()
+        incoming_metadata = dict(fields.get("metadata", {}))
+        incoming_metadata.setdefault("merged_request_count", 1)
+        incoming_metadata.setdefault("dedupe_mode", "request_merge")
+        incoming_metadata.setdefault("merged_work_item_ids", [item for item in [work_item_id] if item])
+        incoming_metadata.setdefault("merged_consumer_work_item_ids", [item for item in [consumer_work_item_id] if item])
+        incoming_metadata.setdefault("merged_provider_work_item_ids", [item for item in [provider_work_item_id] if item])
+
         record = ContractRecord(
             id=str(fields.get("id") or uuid.uuid4())[:36],
             provider_module=str(fields["provider_module"]),
@@ -1233,8 +1284,8 @@ class CoreAgentManager:
             spec=dict(fields.get("spec", {})),
             stub_path=str(fields.get("stub_path", "")),
             implementation_path=str(fields.get("implementation_path", "")),
-            work_item_id=str(fields.get("work_item_id", "")),
-            metadata=dict(fields.get("metadata", {})),
+            work_item_id=work_item_id,
+            metadata=incoming_metadata,
         )
         created = self.workflow_store.create_contract(record)
         self._emit_workflow_event("workflow.contract.created", self._serialize_workflow_record(created))
@@ -1544,6 +1595,84 @@ class CoreAgentManager:
         """Get runtime control attributes for one project scope."""
         normalized, _ = self._normalize_project(project)
         return dict(self._project_runtime_attributes.get(normalized, {}))
+
+    def _project_scheduler_profile(self, project: str) -> dict[str, Any]:
+        """Normalize project runtime attributes into scheduler controls."""
+        normalized, _ = self._normalize_project(project)
+        raw_attributes = dict(self._project_runtime_attributes.get(normalized, {}))
+        scheduler_attributes: dict[str, Any] = {}
+
+        nested_scheduler = raw_attributes.get("scheduler")
+        if isinstance(nested_scheduler, dict):
+            scheduler_attributes.update(nested_scheduler)
+
+        for key in ("dispatch_enabled", "priority_bias", "concurrency_cap", "min_priority"):
+            if key in raw_attributes:
+                scheduler_attributes[key] = raw_attributes[key]
+
+        dispatch_enabled = bool(scheduler_attributes.get("dispatch_enabled", True))
+        priority_bias = int(scheduler_attributes.get("priority_bias", 0))
+        concurrency_cap = max(1, int(scheduler_attributes.get("concurrency_cap", 1)))
+        min_priority = int(scheduler_attributes.get("min_priority", -1_000_000))
+
+        return {
+            "project": normalized,
+            "dispatch_enabled": dispatch_enabled,
+            "priority_bias": priority_bias,
+            "concurrency_cap": concurrency_cap,
+            "min_priority": min_priority,
+            "raw_attributes": raw_attributes,
+        }
+
+    @staticmethod
+    def _dispatch_score(work_item: WorkItemRecord, project_profile: dict[str, Any]) -> int:
+        """Compute one dispatch score from work-item priority and project bias."""
+        return int(work_item.priority) + int(project_profile.get("priority_bias", 0))
+
+    def _module_inflight_count(self, module: str) -> int:
+        """Count running dispatches for one project module."""
+        count = 0
+        for work_item_id in self._running_work_item_dispatches:
+            item = self.get_work_item(work_item_id)
+            if item is not None and item.module == module:
+                count += 1
+        return count
+
+    def _build_dispatch_plan(self, ready_items: list[WorkItemRecord]) -> list[dict[str, Any]]:
+        """Rank ready work items by priority and project attributes."""
+        plan: list[dict[str, Any]] = []
+        for item in ready_items:
+            if item.module not in self._allowed_project_scopes:
+                continue
+
+            profile = self._project_scheduler_profile(item.module)
+            if not profile["dispatch_enabled"]:
+                continue
+            if int(item.priority) < int(profile["min_priority"]):
+                continue
+
+            score = self._dispatch_score(item, profile)
+            plan.append(
+                {
+                    "work_item_id": item.id,
+                    "module": item.module,
+                    "score": score,
+                    "priority": item.priority,
+                    "priority_bias": profile["priority_bias"],
+                    "concurrency_cap": profile["concurrency_cap"],
+                    "profile": profile,
+                }
+            )
+
+        plan.sort(
+            key=lambda entry: (
+                -int(entry["score"]),
+                -int(entry["priority"]),
+                str(entry["module"]),
+                str(entry["work_item_id"]),
+            )
+        )
+        return plan
 
     def list_project_scopes(self, max_depth: int = 2, include_files: bool = False) -> list[str]:
         """List delegable project scopes under the core workspace."""

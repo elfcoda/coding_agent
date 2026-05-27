@@ -11,11 +11,15 @@
 
 最小可跑通的完整 demo 后端定义（建议你以这个为目标）
 
-
-
-
 scheduler 按属性+优先级并发派发 project agents。
-contract 请求统一去重，形成单一 contract 工单，多消费者订阅。
+
+
+
+
+
+
+
+
 任一 contract 版本变化触发链式 revalidation，前端高亮受影响节点并要求人工确认。
 
 
