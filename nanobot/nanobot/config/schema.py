@@ -218,12 +218,21 @@ class ToolsConfig(BaseModel):
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 
+class ControlPlaneConfig(BaseModel):
+    """HTTP control-plane security and traffic controls."""
+    api_key: str = ""
+    require_api_key: bool = False
+    rate_limit_per_minute: int = 0
+    rate_limit_window_seconds: int = 60
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    control_plane: ControlPlaneConfig = Field(default_factory=ControlPlaneConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
     @property

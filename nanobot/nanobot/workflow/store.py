@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -95,6 +96,17 @@ class DecisionRecord:
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=_now_iso)
     updated_at: str = field(default_factory=_now_iso)
+
+
+@dataclass(slots=True)
+class MetricsSnapshotRecord:
+    """Persistent observability snapshot for time-series dashboards."""
+
+    id: str
+    snapshot_type: str
+    generated_at: str
+    metrics: dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=_now_iso)
 
 
 class WorkflowStore:
@@ -200,6 +212,17 @@ class WorkflowStore:
                 CREATE INDEX IF NOT EXISTS idx_decisions_work_item_id ON decisions(work_item_id);
                 CREATE INDEX IF NOT EXISTS idx_decisions_decision_type ON decisions(decision_type);
                 CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
+
+                CREATE TABLE IF NOT EXISTS metrics_snapshots (
+                    id TEXT PRIMARY KEY,
+                    snapshot_type TEXT NOT NULL DEFAULT 'observability',
+                    generated_at TEXT NOT NULL,
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_metrics_snapshots_snapshot_type ON metrics_snapshots(snapshot_type);
+                CREATE INDEX IF NOT EXISTS idx_metrics_snapshots_generated_at ON metrics_snapshots(generated_at);
                 """
             )
 
@@ -676,6 +699,52 @@ class WorkflowStore:
         with self._connect() as connection:
             cursor = connection.execute("DELETE FROM decisions WHERE id = ?", (decision_id,))
         return cursor.rowcount > 0
+
+    def create_metrics_snapshot(self, metrics: dict[str, Any], snapshot_type: str = "observability") -> MetricsSnapshotRecord:
+        record = MetricsSnapshotRecord(
+            id=str(uuid.uuid4())[:36],
+            snapshot_type=str(snapshot_type or "observability"),
+            generated_at=str(metrics.get("generated_at") or _now_iso()),
+            metrics=dict(metrics),
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO metrics_snapshots (
+                    id, snapshot_type, generated_at, metrics_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    record.id,
+                    record.snapshot_type,
+                    record.generated_at,
+                    _encode_json(record.metrics),
+                    record.created_at,
+                ),
+            )
+        return record
+
+    def list_metrics_snapshots(self, *, snapshot_type: str | None = None, limit: int = 100) -> list[MetricsSnapshotRecord]:
+        query = "SELECT * FROM metrics_snapshots"
+        params: list[Any] = []
+        if snapshot_type:
+            query += " WHERE snapshot_type = ?"
+            params.append(snapshot_type)
+        query += " ORDER BY generated_at DESC, created_at DESC LIMIT ?"
+        params.append(limit)
+
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [
+            MetricsSnapshotRecord(
+                id=row["id"],
+                snapshot_type=row["snapshot_type"],
+                generated_at=row["generated_at"],
+                metrics=_decode_json(row["metrics_json"], {}),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
 
     def _row_to_work_item(self, row: sqlite3.Row) -> WorkItemRecord:
         return WorkItemRecord(

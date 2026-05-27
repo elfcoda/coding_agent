@@ -430,7 +430,7 @@ def gateway(
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
     console.print(f"[green]✓[/green] Control plane: http://{host}:{port}/api/control/health")
 
-    control_plane_app = create_control_plane_app(agent)
+    control_plane_app = create_control_plane_app(agent, config.control_plane)
     uvicorn_config = uvicorn.Config(control_plane_app, host=host, port=port, log_level="info")
     control_plane_server = uvicorn.Server(uvicorn_config)
 

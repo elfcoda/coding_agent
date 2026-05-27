@@ -112,6 +112,8 @@ class CoreAgentManager:
         self._decision_default_degradation = default_degradation
         self._decision_sla_blocked_modules: set[str] = set()
         self._decision_sla_global_block = False
+        self._metrics_snapshot_interval_seconds = 60.0
+        self._last_metrics_snapshot_at: str | None = None
         self._reconciler_task: asyncio.Task[None] | None = None
         self._running_work_item_dispatches: dict[str, asyncio.Task[None]] = {}
         self._project_runtime_attributes: dict[str, dict[str, Any]] = {}
@@ -1303,6 +1305,40 @@ class CoreAgentManager:
             },
         }
 
+    def list_observability_snapshots(self, limit: int = 120, snapshot_type: str = "observability") -> list[dict[str, Any]]:
+        snapshots = self.workflow_store.list_metrics_snapshots(snapshot_type=snapshot_type, limit=limit)
+        return [
+            {
+                "id": snapshot.id,
+                "snapshot_type": snapshot.snapshot_type,
+                "generated_at": snapshot.generated_at,
+                "created_at": snapshot.created_at,
+                "metrics": snapshot.metrics,
+            }
+            for snapshot in snapshots
+        ]
+
+    def _maybe_capture_metrics_snapshot(self, force: bool = False) -> dict[str, Any] | None:
+        now_iso = self._now_iso()
+        due = force or self._last_metrics_snapshot_at is None
+        if not due and self._last_metrics_snapshot_at is not None:
+            elapsed = self._seconds_between(self._last_metrics_snapshot_at, now_iso)
+            due = bool(elapsed is not None and elapsed >= self._metrics_snapshot_interval_seconds)
+        if not due:
+            return None
+
+        snapshot = self.get_observability_metrics(limit=500)
+        self.workflow_store.create_metrics_snapshot(snapshot, snapshot_type="observability")
+        self._last_metrics_snapshot_at = now_iso
+        self._emit_workflow_event(
+            "workflow.metrics.snapshot.captured",
+            {
+                "generated_at": snapshot["generated_at"],
+                "snapshot_type": "observability",
+            },
+        )
+        return snapshot
+
     async def _dispatch_claimed_work_item(self, work_item_id: str) -> None:
         """Run one ready work item through the matching module agent."""
         item = self.get_work_item(work_item_id)
@@ -1520,6 +1556,7 @@ class CoreAgentManager:
             while True:
                 self.run_workflow_scheduler_tick(limit=300)
                 await self._dispatch_ready_work_items(limit=150)
+                self._maybe_capture_metrics_snapshot()
                 await asyncio.sleep(self._reconciler_interval_seconds)
         except asyncio.CancelledError:
             raise

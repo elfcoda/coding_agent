@@ -201,6 +201,19 @@ Tips:
 
 ---
 
+## 🛡 Control Plane Security and Metrics History
+
+For shared demos or production use, the nanobot control plane supports:
+
+- API-key protection via `NANOBOT_CONTROL_PLANE__API_KEY`
+- Optional hard enforcement via `NANOBOT_CONTROL_PLANE__REQUIRE_API_KEY=true`
+- In-memory per-client rate limiting via `NANOBOT_CONTROL_PLANE__RATE_LIMIT_PER_MINUTE`
+- Historical observability snapshots stored in SQLite and queryable at `/api/control/metrics/snapshots`
+
+Local demo runs can leave these values empty or disabled.
+
+---
+
 ## 📦 Installation
 
 FastCode supports **Linux**, **macOS**, and **Windows**. Choose your platform below:

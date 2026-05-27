@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import asdict
 from datetime import datetime, timezone
+from collections import deque
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from nanobot.agent.core_manager import CoreAgentManager
+from nanobot.config.schema import ControlPlaneConfig
 
 
 class WorkflowManageRequest(BaseModel):
@@ -111,14 +115,55 @@ def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def create_control_plane_app(manager: CoreAgentManager) -> FastAPI:
+def create_control_plane_app(
+    manager: CoreAgentManager,
+    control_plane: ControlPlaneConfig | None = None,
+) -> FastAPI:
     """Create a small HTTP control plane over CoreAgentManager."""
+
+    control_plane = control_plane or ControlPlaneConfig()
+    api_key = str(control_plane.api_key or "").strip()
+    require_api_key = bool(control_plane.require_api_key or api_key)
+    rate_limit_per_minute = max(0, int(control_plane.rate_limit_per_minute))
+    rate_limit_window_seconds = max(1, int(control_plane.rate_limit_window_seconds or 60))
+    request_windows: dict[str, deque[float]] = {}
+    rate_lock = asyncio.Lock()
 
     app = FastAPI(
         title="nanobot-control-plane",
         version="0.1.0",
         description="Demo control plane for multi-agent orchestration",
     )
+
+    @app.middleware("http")
+    async def guard_control_plane(request: Request, call_next):
+        if request.url.path == "/api/control/health":
+            return await call_next(request)
+
+        if require_api_key:
+            presented = request.headers.get("X-Nanobot-API-Key", "").strip()
+            if not api_key or presented != api_key:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Unauthorized: missing or invalid X-Nanobot-API-Key"},
+                )
+
+        if rate_limit_per_minute > 0:
+            client_host = request.client.host if request.client else "unknown"
+            now_ts = datetime.now(timezone.utc).timestamp()
+            async with rate_lock:
+                window = request_windows.setdefault(client_host, deque())
+                cutoff = now_ts - rate_limit_window_seconds
+                while window and window[0] < cutoff:
+                    window.popleft()
+                if len(window) >= rate_limit_per_minute:
+                    return JSONResponse(
+                        status_code=429,
+                        content={"detail": "Rate limit exceeded"},
+                    )
+                window.append(now_ts)
+
+        return await call_next(request)
 
     @app.get("/api/control/health")
     async def health() -> dict[str, Any]:
@@ -176,6 +221,17 @@ def create_control_plane_app(manager: CoreAgentManager) -> FastAPI:
             "ok": True,
             "generated_at": payload["generated_at"],
             "decisions": payload["decisions"],
+        }
+
+    @app.get("/api/control/metrics/snapshots")
+    async def metrics_snapshots(limit: int = 120, snapshot_type: str = "observability") -> dict[str, Any]:
+        safe_limit = max(1, min(limit, 1000))
+        snapshots = manager.list_observability_snapshots(limit=safe_limit, snapshot_type=snapshot_type)
+        return {
+            "ok": True,
+            "count": len(snapshots),
+            "snapshot_type": snapshot_type,
+            "items": snapshots,
         }
 
     @app.get("/api/control/decisions/queue")
