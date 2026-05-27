@@ -343,6 +343,269 @@ class CoreAgentManager:
             updated = self.update_work_item(work_item.id, updates)
             self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(updated))
 
+    @staticmethod
+    def _is_contract_resolved(status: str) -> bool:
+        return status in {"accepted", "implemented", "completed"}
+
+    @staticmethod
+    def _is_contract_invalidation_status(status: str) -> bool:
+        return status in {"requested", "draft", "invalidated", "deprecated", "superseded", "rejected"}
+
+    def _linked_contract_edges(self, contract_id: str, limit: int = 2000) -> list[DependencyEdgeRecord]:
+        edges = self.list_dependency_edges(limit=limit)
+        return [edge for edge in edges if str(edge.metadata.get("contract_id") or "") == contract_id]
+
+    def _resolve_contract_path(self, value: str) -> Path:
+        raw = (value or "").strip().replace("\\", "/")
+        candidate = Path(raw)
+        if candidate.is_absolute():
+            return candidate
+        return (self.workspace / raw).resolve()
+
+    def _run_contract_revalidation_checks(self, contract: ContractRecord) -> dict[str, Any]:
+        """Run minimal executable checks before clearing revalidation markers."""
+        errors: list[str] = []
+        checks: list[dict[str, Any]] = []
+
+        resolved = self._is_contract_resolved(contract.status)
+        checks.append({"name": "contract_resolved", "ok": resolved, "status": contract.status})
+        if not resolved:
+            errors.append(f"contract status is not resolved: {contract.status}")
+
+        edges = self._linked_contract_edges(contract.id)
+        for edge in edges:
+            required_version_raw = edge.metadata.get("required_contract_version")
+            required_version = int(required_version_raw) if str(required_version_raw or "").strip() else 0
+            ok = required_version <= 0 or contract.version >= required_version
+            checks.append(
+                {
+                    "name": "edge_required_version",
+                    "edge_id": edge.id,
+                    "ok": ok,
+                    "required_version": required_version,
+                    "contract_version": contract.version,
+                }
+            )
+            if not ok:
+                errors.append(
+                    f"edge {edge.id} requires contract version {required_version}, got {contract.version}"
+                )
+
+        if contract.stub_path:
+            stub_path = self._resolve_contract_path(contract.stub_path)
+            exists = stub_path.exists()
+            checks.append({"name": "stub_path_exists", "ok": exists, "path": str(stub_path)})
+            if not exists:
+                errors.append(f"stub path does not exist: {stub_path}")
+
+        if contract.implementation_path:
+            impl_path = self._resolve_contract_path(contract.implementation_path)
+            exists = impl_path.exists()
+            checks.append({"name": "implementation_path_exists", "ok": exists, "path": str(impl_path)})
+            if not exists:
+                errors.append(f"implementation path does not exist: {impl_path}")
+
+        return {
+            "passed": not errors,
+            "errors": errors,
+            "checks": checks,
+            "edge_count": len(edges),
+        }
+
+    def _propagate_contract_invalidation(self, contract: ContractRecord, reason: str) -> None:
+        """Mark linked edges/work items as requiring revalidation when a contract version becomes stale."""
+        edges = self._linked_contract_edges(contract.id)
+        affected_work_item_ids: set[str] = set()
+
+        for edge in edges:
+            next_metadata = {
+                **edge.metadata,
+                "contract_id": contract.id,
+                "revalidation_required": True,
+                "revalidation_reason": reason,
+                "required_contract_version": contract.version,
+            }
+            updated_edge = self.update_dependency_edge(
+                edge.id,
+                {
+                    "metadata": next_metadata,
+                    "status": "active",
+                },
+            )
+            affected_work_item_ids.add(updated_edge.source_work_item_id)
+
+        work_items = self.list_work_items(limit=500)
+        for work_item in work_items:
+            if contract.id not in work_item.blocked_by:
+                continue
+            affected_work_item_ids.add(work_item.id)
+
+        for work_item_id in affected_work_item_ids:
+            work_item = self.get_work_item(work_item_id)
+            if work_item is None:
+                continue
+
+            revalidation_meta = {
+                "required": True,
+                "contract_id": contract.id,
+                "required_version": contract.version,
+                "reason": reason,
+            }
+            metadata = {**work_item.metadata, "revalidation": revalidation_meta}
+            next_blocked_by = self._unique_list(list(work_item.blocked_by) + [contract.id])
+            updates: dict[str, Any] = {
+                "metadata": metadata,
+                "blocked_by": next_blocked_by,
+            }
+            if work_item.status not in {"blocked", "waiting_decision"}:
+                updates["status"] = "blocked"
+
+            updated = self.update_work_item(work_item.id, updates)
+            self._emit_workflow_event("workflow.work_item.revalidation.required", self._serialize_workflow_record(updated))
+
+        self._emit_workflow_event(
+            "workflow.contract.version.invalidated",
+            {
+                "contract_id": contract.id,
+                "version": contract.version,
+                "reason": reason,
+                "affected_edge_count": len(edges),
+                "affected_work_item_count": len(affected_work_item_ids),
+            },
+        )
+
+    def _clear_contract_revalidation(self, contract: ContractRecord) -> None:
+        """Clear revalidation markers only after executable checks pass."""
+        report = self._run_contract_revalidation_checks(contract)
+        if not report["passed"]:
+            # 还有两个现实场景需要这个兜底
+            # 1. 人工或其他流程把状态改成了 ready/in_progress，失败分支要强制回收。
+            # 2. 历史数据漂移（metadata 有 revalidation 标记，但 blocker/status 不一致），失败分支要修复一致性。
+            affected_work_item_ids: set[str] = set()
+            edges = self._linked_contract_edges(contract.id)
+            for edge in edges:
+                affected_work_item_ids.add(edge.source_work_item_id)
+
+            work_items = self.list_work_items(limit=500)
+            for work_item in work_items:
+                marker = dict(work_item.metadata.get("revalidation", {}))
+                if str(marker.get("contract_id") or "") == contract.id:
+                    affected_work_item_ids.add(work_item.id)
+
+            for work_item_id in affected_work_item_ids:
+                work_item = self.get_work_item(work_item_id)
+                if work_item is None:
+                    continue
+
+                marker = dict(work_item.metadata.get("revalidation", {}))
+                marker.update(
+                    {
+                        "required": True,
+                        "contract_id": contract.id,
+                        "required_version": marker.get("required_version") or contract.version,
+                        "last_failed_checks": report["errors"],
+                    }
+                )
+                next_blocked_by = self._unique_list(list(work_item.blocked_by) + [contract.id])
+                updates: dict[str, Any] = {
+                    "metadata": {**work_item.metadata, "revalidation": marker},
+                    "blocked_by": next_blocked_by,
+                }
+                if work_item.status not in {"blocked", "waiting_decision"}:
+                    updates["status"] = "blocked"
+
+                updated = self.update_work_item(work_item.id, updates)
+                self._emit_workflow_event("workflow.work_item.revalidation.failed", self._serialize_workflow_record(updated))
+
+            self._emit_workflow_event(
+                "workflow.contract.revalidation.failed",
+                {
+                    "contract_id": contract.id,
+                    "version": contract.version,
+                    "status": contract.status,
+                    "errors": report["errors"],
+                    "checks": report["checks"],
+                    "edge_count": report["edge_count"],
+                },
+            )
+            return
+
+        edges = self._linked_contract_edges(contract.id)
+        for edge in edges:
+            metadata = dict(edge.metadata)
+            if not metadata.get("revalidation_required"):
+                continue
+            metadata["revalidation_required"] = False
+            metadata["validated_contract_version"] = contract.version
+            self.update_dependency_edge(edge.id, {"metadata": metadata})
+
+        work_items = self.list_work_items(limit=500)
+        for work_item in work_items:
+            marker = dict(work_item.metadata.get("revalidation", {}))
+            if str(marker.get("contract_id") or "") != contract.id:
+                continue
+            required_version_raw = marker.get("required_version")
+            required_version = int(required_version_raw) if str(required_version_raw or "").strip() else 0
+            if required_version > 0 and contract.version < required_version:
+                self._emit_workflow_event(
+                    "workflow.work_item.revalidation.failed",
+                    {
+                        "work_item_id": work_item.id,
+                        "contract_id": contract.id,
+                        "required_version": required_version,
+                        "contract_version": contract.version,
+                        "reason": "contract_version_too_low",
+                    },
+                )
+                continue
+            marker["required"] = False
+            marker["validated_version"] = contract.version
+            next_blocked_by = [entry for entry in work_item.blocked_by if entry != contract.id]
+            updates: dict[str, Any] = {
+                "metadata": {**work_item.metadata, "revalidation": marker},
+                "blocked_by": next_blocked_by,
+            }
+            if work_item.status == "blocked" and not next_blocked_by:
+                updates["status"] = "ready"
+
+            updated = self.update_work_item(work_item.id, updates)
+            self._emit_workflow_event("workflow.work_item.revalidation.cleared", self._serialize_workflow_record(updated))
+
+        self._emit_workflow_event(
+            "workflow.contract.revalidation.passed",
+            {
+                "contract_id": contract.id,
+                "version": contract.version,
+                "status": contract.status,
+                "checks": report["checks"],
+                "edge_count": report["edge_count"],
+            },
+        )
+
+    def _apply_contract_version_invalidation(
+        self,
+        previous: ContractRecord,
+        updated: ContractRecord,
+        changes: dict[str, Any],
+    ) -> None:
+        """Propagate version invalidation and request downstream revalidation."""
+        explicit_invalidate = bool(changes.get("invalidate_dependents", False))
+        version_bumped = updated.version > previous.version
+        regressed_from_resolved = self._is_contract_resolved(previous.status) and self._is_contract_invalidation_status(updated.status)
+
+        if explicit_invalidate or version_bumped or regressed_from_resolved:
+            if explicit_invalidate:
+                reason = "manual_invalidation"
+            elif version_bumped:
+                reason = f"version_bumped:{previous.version}->{updated.version}"
+            else:
+                reason = f"status_regressed:{previous.status}->{updated.status}"
+            self._propagate_contract_invalidation(updated, reason)
+            return
+
+        if self._is_contract_resolved(updated.status):
+            self._clear_contract_revalidation(updated)
+
     def _apply_contract_side_effects(self, contract: ContractRecord, fields: dict[str, Any]) -> None:
         """Auto-link contract lifecycle with dependency edges and work item blockers."""
         auto_edge = bool(fields.get("auto_create_dependency_edge", True))
@@ -766,9 +1029,13 @@ class CoreAgentManager:
         )
 
     def update_contract(self, record_id: str, changes: dict[str, Any]) -> ContractRecord:
+        previous = self.get_contract(record_id)
+        if previous is None:
+            raise ValueError(f"Unknown contract id: {record_id}")
         updated = self.workflow_store.update_contract(record_id, **changes)
         self._emit_workflow_event("workflow.contract.updated", self._serialize_workflow_record(updated))
         self._apply_contract_side_effects(updated, changes)
+        self._apply_contract_version_invalidation(previous, updated, changes)
         return updated
 
     def delete_contract(self, record_id: str) -> bool:

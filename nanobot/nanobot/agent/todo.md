@@ -82,7 +82,7 @@ Module
 
 建议的落地顺序
 
-
-
-最后再做
-
+保留当前默认一跳。
+增加可配置链式模式（按 edge_type 白名单，比如仅 requires_contract）。
+增加 max_depth（先 2 或 3）+ visited 防环。
+事件里带 depth/path，便于前端解释。
