@@ -26,6 +26,12 @@ app = typer.Typer(
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 
+
+def _load_cli_config(config_path: Path | None = None):
+    from nanobot.config.loader import load_config
+
+    return load_config(config_path)
+
 # ---------------------------------------------------------------------------
 # Lightweight CLI input: readline for arrow keys / history, termios for flush
 # ---------------------------------------------------------------------------
@@ -322,6 +328,7 @@ def _make_provider(config):
 def gateway(
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
     host: str = typer.Option("0.0.0.0", "--host", help="Gateway host"),
+    config_path: Path | None = typer.Option(None, "--config-path", help="Explicit config file path; defaults to ~/.nanobot/config.json"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Start the nanobot gateway."""
@@ -342,7 +349,7 @@ def gateway(
 
     console.print(f"{__logo__} Starting nanobot gateway on {host}:{port}...")
 
-    config = load_config()
+    config = _load_cli_config(config_path)
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
@@ -453,6 +460,7 @@ def gateway(
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
     session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
+    config_path: Path | None = typer.Option(None, "--config-path", help="Explicit config file path; defaults to ~/.nanobot/config.json"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
 ):
@@ -462,7 +470,8 @@ def agent(
     from nanobot.agent.core_manager import CoreAgentManager
     from loguru import logger
 
-    config = load_config()
+    # config = load_config()
+    config = _load_cli_config(config_path)
 
     bus = MessageBus()
     provider = _make_provider(config)
@@ -562,11 +571,11 @@ app.add_typer(channels_app, name="channels")
 
 
 @channels_app.command("status")
-def channels_status():
+def channels_status(
+    config_path: Path | None = typer.Option(None, "--config-path", help="Explicit config file path; defaults to ~/.nanobot/config.json"),
+):
     """Show channel status."""
-    from nanobot.config.loader import load_config
-
-    config = load_config()
+    config = _load_cli_config(config_path)
 
     table = Table(title="Channel Status")
     table.add_column("Channel", style="cyan")
@@ -848,20 +857,22 @@ def cron_run(
 
 
 @app.command()
-def status():
+def status(
+    config_path: Path | None = typer.Option(None, "--config-path", help="Explicit config file path; defaults to ~/.nanobot/config.json"),
+):
     """Show nanobot status."""
     from nanobot.config.loader import load_config, get_config_path
 
-    config_path = get_config_path()
-    config = load_config()
+    config_path_value = config_path or get_config_path()
+    config = load_config(config_path)
     workspace = config.workspace_path
 
     console.print(f"{__logo__} nanobot Status\n")
 
-    console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
+    console.print(f"Config: {config_path_value} {'[green]✓[/green]' if config_path_value.exists() else '[red]✗[/red]'}")
     console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
 
-    if config_path.exists():
+    if config_path_value.exists():
         from nanobot.providers.registry import PROVIDERS
 
         console.print(f"Model: {config.agents.defaults.model}")

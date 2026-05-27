@@ -21,49 +21,43 @@ scheduler 按属性+优先级并发派发 project agents。
 
 
 前端高亮受影响节点并要求人工确认。
-要形成“完整 demo”还需要补什么（按优先级）
 
-控制平面 API（最关键，必须补）
-现在 workflow 操作主要是 agent 内部工具调用，不是给前端直接调用的管理 API。
-建议补一组 HTTP API：
-查询图快照（work_items/contracts/dependency_edges/decisions）
-发起调度动作（create work item、delegate、pause/resume/cancel）
-人工决策回写（approve/reject/select option）
-agent 属性变更（你说的“附加属性写入提示词”）
-事件回放与断线续传（必须补）
-当前 WS 是实时广播，缺少事件持久化与重放。
-建议增加 event_log 表和 since_cursor 拉取；前端重连后先拉快照+补事件，避免错过关键决策窗口。
 
-统一去重与合并策略（必须补）
-你的并行模型要稳定，必须有 coalescing：
 
-contract 请求幂等键：provider_module + interface_name + major_version + consumer_module
-在请求进入队列时做去重或合并订阅
-把“重复请求”变成“同一请求多消费者”
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 人工决策优先级与超时策略（必须补）
 你强调人主导，后端要把 decision 作为一等公民：
 decision SLA（多久未决就阻塞哪些 agent）
 decision 队列优先级（影响面大的先推）
 未决时 agent 自动降级策略（返回 stub/等待/局部继续）
+
 动态 prompt 属性注入（必须补）
 你提到前端给 agent 附加属性后要编码到提示词。
 目前 registry 支持静态 prompt_hint，但缺少运行时覆盖。
 建议新增 agent_runtime_attributes 存储并在每次 delegate 时注入 system context。
 
-调度公平性与并发配额（建议补）
-当前只有全局 max_concurrent_dispatches。
-建议增加：每模块并发上限、优先级队列、长任务抢占/回退，避免某模块饿死其他模块。
 
-可观测性指标（建议补）
-给面板加 KPI：
 
-每个 agent 延迟、失败率、排队长度
-每个 contract 生命周期耗时
-decision turnaround 时间
-这些直接决定“人做决策的效率”是否真的提升。
-配置入口统一（建议补）
-CLI 默认读取家目录配置，不是工作区这个文件。见 loader.py:10。
-如果你想 demo 可复现，建议支持显式传入工作区配置路径，否则很容易出现“前端看起来配置了，后端其实没生效”。
+
+
+
+
+
+
+
 
 
 

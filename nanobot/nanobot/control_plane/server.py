@@ -134,6 +134,44 @@ def create_control_plane_app(manager: CoreAgentManager) -> FastAPI:
             "decisions": [asdict(item) for item in manager.list_decisions(limit=safe_limit)],
         }
 
+    @app.get("/api/control/metrics")
+    async def metrics(limit: int = 500) -> dict[str, Any]:
+        safe_limit = max(1, min(limit, 1000))
+        return {
+            "ok": True,
+            **manager.get_observability_metrics(limit=safe_limit),
+        }
+
+    @app.get("/api/control/metrics/agents")
+    async def agent_metrics(limit: int = 500) -> dict[str, Any]:
+        safe_limit = max(1, min(limit, 1000))
+        payload = manager.get_observability_metrics(limit=safe_limit)
+        return {
+            "ok": True,
+            "generated_at": payload["generated_at"],
+            "agents": payload["agents"],
+        }
+
+    @app.get("/api/control/metrics/contracts")
+    async def contract_metrics(limit: int = 500) -> dict[str, Any]:
+        safe_limit = max(1, min(limit, 1000))
+        payload = manager.get_observability_metrics(limit=safe_limit)
+        return {
+            "ok": True,
+            "generated_at": payload["generated_at"],
+            "contracts": payload["contracts"],
+        }
+
+    @app.get("/api/control/metrics/decisions")
+    async def decision_metrics(limit: int = 500) -> dict[str, Any]:
+        safe_limit = max(1, min(limit, 1000))
+        payload = manager.get_observability_metrics(limit=safe_limit)
+        return {
+            "ok": True,
+            "generated_at": payload["generated_at"],
+            "decisions": payload["decisions"],
+        }
+
     @app.post("/api/control/workflow/manage")
     async def manage_workflow(request: WorkflowManageRequest) -> dict[str, Any]:
         try:

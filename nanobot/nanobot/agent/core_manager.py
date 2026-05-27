@@ -8,7 +8,7 @@ import json
 import re
 from collections import deque
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -327,6 +327,49 @@ class CoreAgentManager:
             seen.add(value)
             result.append(value)
         return result
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _parse_iso_datetime(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _seconds_between(cls, start_iso: str | None, end_iso: str | None = None) -> float | None:
+        start = cls._parse_iso_datetime(start_iso)
+        end = cls._parse_iso_datetime(end_iso) if end_iso else datetime.now(timezone.utc)
+        if start is None or end is None:
+            return None
+        return max(0.0, (end - start).total_seconds())
+
+    @staticmethod
+    def _average(values: list[float]) -> float:
+        if not values:
+            return 0.0
+        return sum(values) / len(values)
+
+    @staticmethod
+    def _is_contract_terminal(status: str) -> bool:
+        return status in {"accepted", "implemented", "completed", "rejected", "invalidated", "deprecated", "superseded"}
+
+    @staticmethod
+    def _is_decision_terminal(status: str) -> bool:
+        return status in {"approved", "rejected", "completed"}
 
     def _mergeable_contract_candidate(self, fields: dict[str, Any]) -> ContractRecord | None:
         """Find an existing pending contract request that can absorb a duplicate request."""
@@ -783,6 +826,9 @@ class CoreAgentManager:
             }
             if work_item.status == "blocked" and not next_blocked_by:
                 updates["status"] = "ready"
+                scheduler_meta = dict(work_item.metadata.get("scheduler", {}))
+                scheduler_meta.setdefault("ready_since", self._now_iso())
+                updates["metadata"] = {**work_item.metadata, "revalidation": marker, "scheduler": scheduler_meta}
 
             updated = self.update_work_item(work_item.id, updates)
             self._emit_workflow_event("workflow.work_item.revalidation.cleared", self._serialize_workflow_record(updated))
@@ -961,11 +1007,15 @@ class CoreAgentManager:
                 desired_status = "ready"
 
             if desired_status != work_item.status or desired_decision_required != work_item.decision_required:
+                scheduler_updates: dict[str, Any] = {"state": "reconciled"}
+                if desired_status == "ready":
+                    scheduler_updates["ready_since"] = work_item.metadata.get("scheduler", {}).get("ready_since", self._now_iso())
                 updated = self.update_work_item(
                     work_item.id,
                     {
                         "status": desired_status,
                         "decision_required": desired_decision_required,
+                        "metadata": self._next_work_item_metadata(work_item, **scheduler_updates),
                     },
                 )
                 transition = {
@@ -991,6 +1041,99 @@ class CoreAgentManager:
         metadata["scheduler"] = scheduler_meta
         return metadata
 
+    def get_observability_metrics(self, limit: int = 500) -> dict[str, Any]:
+        work_items = self.list_work_items(limit=limit)
+        contracts = self.list_contracts(limit=limit)
+        decisions = self.list_decisions(limit=limit)
+
+        now_iso = self._now_iso()
+        agent_modules = sorted({item.module for item in work_items})
+        agents: list[dict[str, Any]] = []
+
+        for module in agent_modules:
+            module_items = [item for item in work_items if item.module == module]
+            ready_items = [item for item in module_items if item.status == "ready"]
+            running_items = [item for item in module_items if item.status == "running"]
+            scheduler_entries = [dict(item.metadata.get("scheduler", {})) for item in module_items]
+            attempts = sum(int(entry.get("dispatch_attempt_count", 0)) for entry in scheduler_entries)
+            failures = sum(int(entry.get("dispatch_failure_count", 0)) for entry in scheduler_entries)
+            successes = sum(int(entry.get("dispatch_success_count", 0)) for entry in scheduler_entries)
+            queue_waits = [float(entry.get("last_queue_wait_seconds", 0.0)) for entry in scheduler_entries if entry.get("last_queue_wait_seconds") is not None]
+            durations = [float(entry.get("last_dispatch_duration_seconds", 0.0)) for entry in scheduler_entries if entry.get("last_dispatch_duration_seconds") is not None]
+
+            agents.append(
+                {
+                    "module": module,
+                    "queue_length": len(ready_items),
+                    "running_count": len(running_items),
+                    "dispatch_attempts": attempts,
+                    "dispatch_successes": successes,
+                    "dispatch_failures": failures,
+                    "failure_rate": round(failures / attempts, 4) if attempts else 0.0,
+                    "dispatch_latency_seconds_avg": round(self._average(queue_waits), 3),
+                    "dispatch_duration_seconds_avg": round(self._average(durations), 3),
+                }
+            )
+
+        contract_durations: list[float] = []
+        contract_items: list[dict[str, Any]] = []
+        for contract in contracts:
+            lifecycle = dict(contract.metadata.get("lifecycle", {}))
+            resolved_at = str(lifecycle.get("resolved_at") or "").strip() or None
+            duration = self._seconds_between(contract.created_at, resolved_at or now_iso)
+            if duration is None:
+                continue
+            contract_durations.append(duration)
+            contract_items.append(
+                {
+                    "contract_id": contract.id,
+                    "provider_module": contract.provider_module,
+                    "consumer_module": contract.consumer_module,
+                    "interface_name": contract.interface_name,
+                    "version": contract.version,
+                    "status": contract.status,
+                    "lifecycle_seconds": round(duration, 3),
+                    "resolved": bool(resolved_at),
+                }
+            )
+
+        decision_durations: list[float] = []
+        decision_items: list[dict[str, Any]] = []
+        for decision in decisions:
+            lifecycle = dict(decision.metadata.get("lifecycle", {}))
+            resolved_at = str(lifecycle.get("resolved_at") or "").strip() or None
+            duration = self._seconds_between(decision.created_at, resolved_at or now_iso)
+            if duration is None:
+                continue
+            decision_durations.append(duration)
+            decision_items.append(
+                {
+                    "decision_id": decision.id,
+                    "work_item_id": decision.work_item_id,
+                    "decision_type": decision.decision_type,
+                    "status": decision.status,
+                    "turnaround_seconds": round(duration, 3),
+                    "resolved": bool(resolved_at),
+                }
+            )
+
+        return {
+            "generated_at": now_iso,
+            "agents": sorted(agents, key=lambda item: (item["queue_length"], item["failure_rate"], item["module"]), reverse=True),
+            "contracts": {
+                "count": len(contract_items),
+                "average_lifecycle_seconds": round(self._average(contract_durations), 3),
+                "max_lifecycle_seconds": round(max(contract_durations), 3) if contract_durations else 0.0,
+                "items": contract_items,
+            },
+            "decisions": {
+                "count": len(decision_items),
+                "average_turnaround_seconds": round(self._average(decision_durations), 3),
+                "max_turnaround_seconds": round(max(decision_durations), 3) if decision_durations else 0.0,
+                "items": decision_items,
+            },
+        }
+
     async def _dispatch_claimed_work_item(self, work_item_id: str) -> None:
         """Run one ready work item through the matching module agent."""
         item = self.get_work_item(work_item_id)
@@ -998,6 +1141,8 @@ class CoreAgentManager:
             return
 
         session_key = item.session_key or f"workflow::{item.id}"
+        started_at = self._now_iso()
+        queue_wait_seconds = self._seconds_between(item.metadata.get("scheduler", {}).get("ready_since"), started_at) or 0.0
         try:
             result = await self.delegate_project_task(
                 project=item.module,
@@ -1028,9 +1173,15 @@ class CoreAgentManager:
                     "artifacts": artifacts,
                     "metadata": self._next_work_item_metadata(
                         latest,
+                        dispatch_started_at=started_at,
+                        dispatch_completed_at=self._now_iso(),
+                        last_queue_wait_seconds=queue_wait_seconds,
+                        last_dispatch_duration_seconds=self._seconds_between(started_at, self._now_iso()) or 0.0,
                         last_dispatch_status="ok",
                         last_dispatch_error="",
                         last_session_key=session_key,
+                        dispatch_attempt_count=int(latest.metadata.get("scheduler", {}).get("dispatch_attempt_count", 0)) + 1,
+                        dispatch_success_count=int(latest.metadata.get("scheduler", {}).get("dispatch_success_count", 0)) + 1,
                     ),
                 },
             )
@@ -1049,6 +1200,7 @@ class CoreAgentManager:
             if latest is None:
                 return
 
+            failed_at = self._now_iso()
             fallback_status = "blocked" if latest.status == "running" else latest.status
             updated = self.update_work_item(
                 latest.id,
@@ -1056,9 +1208,15 @@ class CoreAgentManager:
                     "status": fallback_status,
                     "metadata": self._next_work_item_metadata(
                         latest,
+                        dispatch_started_at=started_at,
+                        dispatch_completed_at=failed_at,
+                        last_queue_wait_seconds=queue_wait_seconds,
+                        last_dispatch_duration_seconds=self._seconds_between(started_at, failed_at) or 0.0,
                         last_dispatch_status="error",
                         last_dispatch_error=str(exc),
                         last_session_key=session_key,
+                        dispatch_attempt_count=int(latest.metadata.get("scheduler", {}).get("dispatch_attempt_count", 0)) + 1,
+                        dispatch_failure_count=int(latest.metadata.get("scheduler", {}).get("dispatch_failure_count", 0)) + 1,
                     ),
                 },
             )
@@ -1091,9 +1249,11 @@ class CoreAgentManager:
                 "metadata": self._next_work_item_metadata(
                     current,
                     state="dispatching",
+                    ready_since=current.metadata.get("scheduler", {}).get("ready_since", self._now_iso()),
                     last_dispatch_status="running",
                     last_dispatch_error="",
                     last_session_key=session_key,
+                    dispatch_started_at=self._now_iso(),
                 ),
             },
         )
@@ -1209,6 +1369,11 @@ class CoreAgentManager:
         return asdict(record)
 
     def create_work_item(self, fields: dict[str, Any]) -> WorkItemRecord:
+        metadata = dict(fields.get("metadata", {}))
+        scheduler_meta = dict(metadata.get("scheduler", {}))
+        if str(fields.get("status", "proposed")) == "ready" and not scheduler_meta.get("ready_since"):
+            scheduler_meta["ready_since"] = self._now_iso()
+        metadata["scheduler"] = scheduler_meta
         record = WorkItemRecord(
             id=str(fields.get("id") or uuid.uuid4())[:36],
             module=str(fields["module"]),
@@ -1222,7 +1387,7 @@ class CoreAgentManager:
             depends_on=list(fields.get("depends_on", [])),
             blocked_by=list(fields.get("blocked_by", [])),
             artifacts=list(fields.get("artifacts", [])),
-            metadata=dict(fields.get("metadata", {})),
+            metadata=metadata,
         )
         created = self.workflow_store.create_work_item(record)
         self._emit_workflow_event("workflow.work_item.created", self._serialize_workflow_record(created))
@@ -1357,6 +1522,11 @@ class CoreAgentManager:
         if previous is None:
             raise ValueError(f"Unknown contract id: {record_id}")
         updated = self.workflow_store.update_contract(record_id, **changes)
+        if self._is_contract_terminal(updated.status):
+            lifecycle = dict(updated.metadata.get("lifecycle", {}))
+            if not lifecycle.get("resolved_at"):
+                lifecycle["resolved_at"] = self._now_iso()
+                updated = self.workflow_store.update_contract(record_id, metadata={**updated.metadata, "lifecycle": lifecycle})
         self._emit_workflow_event("workflow.contract.updated", self._serialize_workflow_record(updated))
         self._apply_contract_side_effects(updated, changes)
         self._apply_contract_version_invalidation(previous, updated, changes)
@@ -1435,6 +1605,11 @@ class CoreAgentManager:
 
     def update_decision(self, record_id: str, changes: dict[str, Any]) -> DecisionRecord:
         updated = self.workflow_store.update_decision(record_id, **changes)
+        if self._is_decision_terminal(updated.status):
+            lifecycle = dict(updated.metadata.get("lifecycle", {}))
+            if not lifecycle.get("resolved_at"):
+                lifecycle["resolved_at"] = self._now_iso()
+                updated = self.workflow_store.update_decision(record_id, metadata={**updated.metadata, "lifecycle": lifecycle})
         self._emit_workflow_event("workflow.decision.updated", self._serialize_workflow_record(updated))
         self._apply_decision_side_effects(updated)
         return updated
