@@ -364,6 +364,9 @@ def gateway(
         project_registry=config.agents.defaults.project_registry,
         scheduler_reconcile_interval_seconds=config.agents.defaults.scheduler.reconcile_interval_seconds,
         scheduler_max_concurrent_dispatches=config.agents.defaults.scheduler.max_concurrent_dispatches,
+        revalidation_chain_enabled=config.agents.defaults.scheduler.revalidation_chain_enabled,
+        revalidation_chain_edge_types=config.agents.defaults.scheduler.revalidation_chain_edge_types,
+        revalidation_chain_max_depth=config.agents.defaults.scheduler.revalidation_chain_max_depth,
     )
 
     # Set cron callback (needs agent)
@@ -472,6 +475,9 @@ def agent(
         project_registry=config.agents.defaults.project_registry,
         scheduler_reconcile_interval_seconds=config.agents.defaults.scheduler.reconcile_interval_seconds,
         scheduler_max_concurrent_dispatches=config.agents.defaults.scheduler.max_concurrent_dispatches,
+        revalidation_chain_enabled=config.agents.defaults.scheduler.revalidation_chain_enabled,
+        revalidation_chain_edge_types=config.agents.defaults.scheduler.revalidation_chain_edge_types,
+        revalidation_chain_max_depth=config.agents.defaults.scheduler.revalidation_chain_max_depth,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on

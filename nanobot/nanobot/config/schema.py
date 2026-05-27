@@ -139,6 +139,9 @@ class SchedulerConfig(BaseModel):
     """Workflow reconciler/scheduler runtime controls."""
     reconcile_interval_seconds: float = 3.0
     max_concurrent_dispatches: int = 4
+    revalidation_chain_enabled: bool = False
+    revalidation_chain_edge_types: list[str] = Field(default_factory=lambda: ["requires_contract"])
+    revalidation_chain_max_depth: int = 2
 
 
 class AgentDefaults(BaseModel):

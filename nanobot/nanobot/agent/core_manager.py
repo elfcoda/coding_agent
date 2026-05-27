@@ -6,6 +6,7 @@ import asyncio
 import uuid
 import json
 import re
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -66,6 +67,9 @@ class CoreAgentManager:
         workflow_store: WorkflowStore | None = None,
         scheduler_reconcile_interval_seconds: float = 3.0,
         scheduler_max_concurrent_dispatches: int = 4,
+        revalidation_chain_enabled: bool = False,
+        revalidation_chain_edge_types: list[str] | None = None,
+        revalidation_chain_max_depth: int = 2,
     ):
         from nanobot.config.schema import ExecToolConfig
 
@@ -85,6 +89,10 @@ class CoreAgentManager:
         self._batch_status: dict[str, dict[str, Any]] = {}
         self._reconciler_interval_seconds = max(0.2, float(scheduler_reconcile_interval_seconds))
         self._scheduler_max_concurrent_dispatches = max(1, int(scheduler_max_concurrent_dispatches))
+        self._revalidation_chain_enabled = bool(revalidation_chain_enabled)
+        edge_types = [str(item).strip() for item in (revalidation_chain_edge_types or ["requires_contract"]) if str(item).strip()]
+        self._revalidation_chain_edge_types = set(edge_types or ["requires_contract"])
+        self._revalidation_chain_max_depth = max(1, int(revalidation_chain_max_depth))
         self._reconciler_task: asyncio.Task[None] | None = None
         self._running_work_item_dispatches: dict[str, asyncio.Task[None]] = {}
         self._scope_exclude_names = {
@@ -415,7 +423,9 @@ class CoreAgentManager:
     def _propagate_contract_invalidation(self, contract: ContractRecord, reason: str) -> None:
         """Mark linked edges/work items as requiring revalidation when a contract version becomes stale."""
         edges = self._linked_contract_edges(contract.id)
-        affected_work_item_ids: set[str] = set()
+        direct_affected_ids: set[str] = set()
+        depths: dict[str, int] = {}
+        paths: dict[str, list[str]] = {}
 
         for edge in edges:
             next_metadata = {
@@ -432,13 +442,49 @@ class CoreAgentManager:
                     "status": "active",
                 },
             )
-            affected_work_item_ids.add(updated_edge.source_work_item_id)
+            source_id = updated_edge.source_work_item_id
+            direct_affected_ids.add(source_id)
+            depths[source_id] = 1
+            paths[source_id] = [source_id]
 
         work_items = self.list_work_items(limit=500)
         for work_item in work_items:
             if contract.id not in work_item.blocked_by:
                 continue
-            affected_work_item_ids.add(work_item.id)
+            direct_affected_ids.add(work_item.id)
+            depths.setdefault(work_item.id, 1)
+            paths.setdefault(work_item.id, [work_item.id])
+
+        # 处理链式多跳的完整的依赖关系传播
+        if self._revalidation_chain_enabled and direct_affected_ids:
+            active_edges = self.list_dependency_edges(filters={"status": "active"}, limit=5000)
+            incoming: dict[str, list[tuple[str, str]]] = {}
+            for edge in active_edges:
+                if edge.edge_type not in self._revalidation_chain_edge_types:
+                    continue
+                incoming.setdefault(edge.target_work_item_id, []).append((edge.source_work_item_id, edge.id))
+
+            queue: deque[tuple[str, int, list[str]]] = deque(
+                (work_item_id, depths.get(work_item_id, 1), paths.get(work_item_id, [work_item_id]))
+                for work_item_id in direct_affected_ids
+            )
+
+            while queue:
+                current_id, current_depth, current_path = queue.popleft()
+                if current_depth >= self._revalidation_chain_max_depth:
+                    continue
+
+                for source_id, _ in incoming.get(current_id, []):
+                    next_depth = current_depth + 1
+                    previous_depth = depths.get(source_id)
+                    if previous_depth is not None and previous_depth <= next_depth:
+                        continue
+                    next_path = [*current_path, source_id]
+                    depths[source_id] = next_depth
+                    paths[source_id] = next_path
+                    queue.append((source_id, next_depth, next_path))
+
+        affected_work_item_ids = set(depths)
 
         for work_item_id in affected_work_item_ids:
             work_item = self.get_work_item(work_item_id)
@@ -450,6 +496,8 @@ class CoreAgentManager:
                 "contract_id": contract.id,
                 "required_version": contract.version,
                 "reason": reason,
+                "depth": depths.get(work_item_id, 1),
+                "path": paths.get(work_item_id, [work_item_id]),
             }
             metadata = {**work_item.metadata, "revalidation": revalidation_meta}
             next_blocked_by = self._unique_list(list(work_item.blocked_by) + [contract.id])
@@ -462,6 +510,16 @@ class CoreAgentManager:
 
             updated = self.update_work_item(work_item.id, updates)
             self._emit_workflow_event("workflow.work_item.revalidation.required", self._serialize_workflow_record(updated))
+            self._emit_workflow_event(
+                "workflow.work_item.revalidation.propagated",
+                {
+                    "work_item_id": updated.id,
+                    "contract_id": contract.id,
+                    "reason": reason,
+                    "depth": depths.get(work_item_id, 1),
+                    "path": paths.get(work_item_id, [work_item_id]),
+                },
+            )
 
         self._emit_workflow_event(
             "workflow.contract.version.invalidated",
@@ -470,7 +528,19 @@ class CoreAgentManager:
                 "version": contract.version,
                 "reason": reason,
                 "affected_edge_count": len(edges),
+                "direct_affected_work_item_count": len(direct_affected_ids),
                 "affected_work_item_count": len(affected_work_item_ids),
+                "chain_mode": "dag" if self._revalidation_chain_enabled else "one_hop",
+                "chain_edge_types": sorted(self._revalidation_chain_edge_types),
+                "max_depth": self._revalidation_chain_max_depth,
+                "affected": [
+                    {
+                        "work_item_id": work_item_id,
+                        "depth": depths.get(work_item_id, 1),
+                        "path": paths.get(work_item_id, [work_item_id]),
+                    }
+                    for work_item_id in sorted(affected_work_item_ids)
+                ],
             },
         )
 
