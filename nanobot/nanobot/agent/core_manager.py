@@ -806,14 +806,14 @@ class CoreAgentManager:
     ) -> None:
         """Propagate version invalidation and request downstream revalidation."""
         explicit_invalidate = bool(changes.get("invalidate_dependents", False))
-        version_bumped = updated.version > previous.version
+        version_changed = updated.version != previous.version
         regressed_from_resolved = self._is_contract_resolved(previous.status) and self._is_contract_invalidation_status(updated.status)
 
-        if explicit_invalidate or version_bumped or regressed_from_resolved:
+        if explicit_invalidate or version_changed or regressed_from_resolved:
             if explicit_invalidate:
                 reason = "manual_invalidation"
-            elif version_bumped:
-                reason = f"version_bumped:{previous.version}->{updated.version}"
+            elif version_changed:
+                reason = f"version_changed:{previous.version}->{updated.version}"
             else:
                 reason = f"status_regressed:{previous.status}->{updated.status}"
             self._propagate_contract_invalidation(updated, reason)
