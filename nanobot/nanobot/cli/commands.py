@@ -321,6 +321,7 @@ def _make_provider(config):
 @app.command()
 def gateway(
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    host: str = typer.Option("0.0.0.0", "--host", help="Gateway host"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Start the nanobot gateway."""
@@ -332,12 +333,14 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
+    from nanobot.control_plane import create_control_plane_app
+    import uvicorn
 
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
 
-    console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
+    console.print(f"{__logo__} Starting nanobot gateway on {host}:{port}...")
 
     config = load_config()
     bus = MessageBus()
@@ -413,6 +416,11 @@ def gateway(
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
+    console.print(f"[green]✓[/green] Control plane: http://{host}:{port}/api/control/health")
+
+    control_plane_app = create_control_plane_app(agent)
+    uvicorn_config = uvicorn.Config(control_plane_app, host=host, port=port, log_level="info")
+    control_plane_server = uvicorn.Server(uvicorn_config)
 
     async def run():
         try:
@@ -421,12 +429,14 @@ def gateway(
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
+                control_plane_server.serve(),
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
             heartbeat.stop()
             cron.stop()
             agent.stop()
+            control_plane_server.should_exit = True
             await channels.stop_all()
 
     asyncio.run(run())

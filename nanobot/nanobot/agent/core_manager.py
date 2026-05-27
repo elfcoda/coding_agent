@@ -95,6 +95,7 @@ class CoreAgentManager:
         self._revalidation_chain_max_depth = max(1, int(revalidation_chain_max_depth))
         self._reconciler_task: asyncio.Task[None] | None = None
         self._running_work_item_dispatches: dict[str, asyncio.Task[None]] = {}
+        self._project_runtime_attributes: dict[str, dict[str, Any]] = {}
         self._scope_exclude_names = {
             ".git",
             ".hg",
@@ -1323,6 +1324,25 @@ class CoreAgentManager:
         """Return the fixed project-agent registry entries."""
         return [self._project_registry[path] for path in sorted(self._project_registry)]
 
+    def set_project_runtime_attributes(self, project: str, attributes: dict[str, Any]) -> dict[str, Any]:
+        """Set runtime control attributes for one project scope."""
+        normalized, _ = self._normalize_project(project)
+        next_attributes = dict(attributes or {})
+        self._project_runtime_attributes[normalized] = next_attributes
+        self._emit_workflow_event(
+            "workflow.project_agent.attributes.updated",
+            {
+                "project": normalized,
+                "attributes": next_attributes,
+            },
+        )
+        return next_attributes
+
+    def get_project_runtime_attributes(self, project: str) -> dict[str, Any]:
+        """Get runtime control attributes for one project scope."""
+        normalized, _ = self._normalize_project(project)
+        return dict(self._project_runtime_attributes.get(normalized, {}))
+
     def list_project_scopes(self, max_depth: int = 2, include_files: bool = False) -> list[str]:
         """List delegable project scopes under the core workspace."""
         if self._project_registry:
@@ -1419,13 +1439,61 @@ class CoreAgentManager:
         loop = self.get_project_loop(project)
         normalized, _ = self._normalize_project(project)
         project_session = f"{session_key}::project::{normalized.replace('/', ':')}"
-        result = await loop.process_direct(
-            task,
-            session_key=project_session,
-            channel=channel,
-            chat_id=chat_id,
+        runtime_attributes = dict(self._project_runtime_attributes.get(normalized, {}))
+        delegated_task = task
+        if runtime_attributes:
+            attributes_json = json.dumps(runtime_attributes, ensure_ascii=False, indent=2)
+            delegated_task = (
+                "[Runtime Control Attributes]\n"
+                f"{attributes_json}\n\n"
+                "Use the attributes above as hard constraints and operation preferences for this task.\n\n"
+                f"[Task]\n{task}"
+            )
+
+        self._emit_workflow_event(
+            "workflow.project_agent.delegation.started",
+            {
+                "project": normalized,
+                "session_key": project_session,
+                "channel": channel,
+                "chat_id": chat_id,
+                "has_runtime_attributes": bool(runtime_attributes),
+                "task_preview": task[:200],
+            },
         )
-        return f"[Project Scope: {normalized}]\n{result}"
+
+        try:
+            result = await loop.process_direct(
+                delegated_task,
+                session_key=project_session,
+                channel=channel,
+                chat_id=chat_id,
+            )
+            self._emit_workflow_event(
+                "workflow.project_agent.delegation.completed",
+                {
+                    "project": normalized,
+                    "session_key": project_session,
+                    "channel": channel,
+                    "chat_id": chat_id,
+                    "has_runtime_attributes": bool(runtime_attributes),
+                    "result_preview": result[:300],
+                },
+            )
+            return f"[Project Scope: {normalized}]\n{result}"
+        except Exception as exc:
+            self._emit_workflow_event(
+                "workflow.project_agent.delegation.failed",
+                {
+                    "project": normalized,
+                    "session_key": project_session,
+                    "channel": channel,
+                    "chat_id": chat_id,
+                    "has_runtime_attributes": bool(runtime_attributes),
+                    "error": str(exc),
+                },
+            )
+            raise
 
     async def delegate_projects_batch(
         self,
