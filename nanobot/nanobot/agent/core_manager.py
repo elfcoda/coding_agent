@@ -1373,7 +1373,8 @@ class CoreAgentManager:
         scheduler_meta = dict(metadata.get("scheduler", {}))
         if str(fields.get("status", "proposed")) == "ready" and not scheduler_meta.get("ready_since"):
             scheduler_meta["ready_since"] = self._now_iso()
-        metadata["scheduler"] = scheduler_meta
+        if scheduler_meta:
+            metadata["scheduler"] = scheduler_meta
         record = WorkItemRecord(
             id=str(fields.get("id") or uuid.uuid4())[:36],
             module=str(fields["module"]),
