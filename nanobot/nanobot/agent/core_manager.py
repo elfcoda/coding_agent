@@ -8,7 +8,7 @@ import json
 import re
 from collections import deque
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -1317,6 +1317,138 @@ class CoreAgentManager:
             }
             for snapshot in snapshots
         ]
+
+    def get_observability_timeseries(
+        self,
+        *,
+        hours: int = 24,
+        bucket_minutes: int = 5,
+        snapshot_type: str = "observability",
+    ) -> dict[str, Any]:
+        safe_hours = max(1, min(hours, 24 * 14))
+        safe_bucket_minutes = max(1, min(bucket_minutes, 60))
+        now_dt = datetime.now(timezone.utc)
+        start_dt = now_dt - timedelta(hours=safe_hours)
+        bucket_seconds = safe_bucket_minutes * 60
+        # Snapshot interval is 1 minute by default. Load a bit extra to absorb restarts/gaps.
+        snapshot_limit = max(120, min(5000, safe_hours * 90))
+
+        snapshots = self.list_observability_snapshots(limit=snapshot_limit, snapshot_type=snapshot_type)
+        buckets: dict[int, dict[str, Any]] = {}
+
+        for row in snapshots:
+            metrics = dict(row.get("metrics") or {})
+            generated_at = str(row.get("generated_at") or metrics.get("generated_at") or "")
+            dt = self._parse_iso_datetime(generated_at)
+            if dt is None:
+                continue
+            if dt < start_dt or dt > now_dt:
+                continue
+
+            ts = int(dt.timestamp())
+            bucket_epoch = ts - (ts % bucket_seconds)
+
+            agents = [dict(item) for item in metrics.get("agents", []) if isinstance(item, dict)]
+            decisions = dict(metrics.get("decisions") or {})
+            contracts = dict(metrics.get("contracts") or {})
+
+            attempts = sum(int(item.get("dispatch_attempts", 0)) for item in agents)
+            failures = sum(int(item.get("dispatch_failures", 0)) for item in agents)
+            queue_total = sum(int(item.get("queue_length", 0)) for item in agents)
+            running_total = sum(int(item.get("running_count", 0)) for item in agents)
+            failure_rate = (failures / attempts) if attempts else self._average([float(item.get("failure_rate", 0.0)) for item in agents])
+            dispatch_latency_avg = self._average([float(item.get("dispatch_latency_seconds_avg", 0.0)) for item in agents])
+
+            pending_count = int(decisions.get("pending_count", 0))
+            overdue_count = int(decisions.get("overdue_count", 0))
+            decision_turnaround = float(decisions.get("average_turnaround_seconds", 0.0))
+
+            contract_lifecycle = float(contracts.get("average_lifecycle_seconds", 0.0))
+            contract_count = int(contracts.get("count", 0))
+
+            bucket = buckets.setdefault(
+                bucket_epoch,
+                {
+                    "samples": 0,
+                    "agents_queue_total": [],
+                    "agents_running_total": [],
+                    "agents_failure_rate": [],
+                    "agents_dispatch_latency": [],
+                    "decisions_pending": [],
+                    "decisions_overdue": [],
+                    "decisions_turnaround": [],
+                    "contracts_lifecycle": [],
+                    "contracts_count": [],
+                },
+            )
+            bucket["samples"] += 1
+            bucket["agents_queue_total"].append(float(queue_total))
+            bucket["agents_running_total"].append(float(running_total))
+            bucket["agents_failure_rate"].append(float(failure_rate))
+            bucket["agents_dispatch_latency"].append(float(dispatch_latency_avg))
+            bucket["decisions_pending"].append(float(pending_count))
+            bucket["decisions_overdue"].append(float(overdue_count))
+            bucket["decisions_turnaround"].append(float(decision_turnaround))
+            bucket["contracts_lifecycle"].append(float(contract_lifecycle))
+            bucket["contracts_count"].append(float(contract_count))
+
+        ordered_epochs = sorted(buckets.keys())
+        points: list[dict[str, Any]] = []
+        series = {
+            "agents_queue_length": [],
+            "agents_failure_rate": [],
+            "agents_dispatch_latency_seconds": [],
+            "decisions_pending": [],
+            "decisions_overdue": [],
+            "contracts_average_lifecycle_seconds": [],
+        }
+
+        for epoch in ordered_epochs:
+            bucket = buckets[epoch]
+            bucket_dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+            point = {
+                "bucket_start": bucket_dt.isoformat(),
+                "samples": int(bucket["samples"]),
+                "agents": {
+                    "queue_length_avg": round(self._average(bucket["agents_queue_total"]), 3),
+                    "queue_length_max": round(max(bucket["agents_queue_total"]), 3) if bucket["agents_queue_total"] else 0.0,
+                    "running_count_avg": round(self._average(bucket["agents_running_total"]), 3),
+                    "failure_rate_avg": round(self._average(bucket["agents_failure_rate"]), 6),
+                    "dispatch_latency_seconds_avg": round(self._average(bucket["agents_dispatch_latency"]), 3),
+                },
+                "decisions": {
+                    "pending_count_avg": round(self._average(bucket["decisions_pending"]), 3),
+                    "pending_count_max": round(max(bucket["decisions_pending"]), 3) if bucket["decisions_pending"] else 0.0,
+                    "overdue_count_avg": round(self._average(bucket["decisions_overdue"]), 3),
+                    "average_turnaround_seconds_avg": round(self._average(bucket["decisions_turnaround"]), 3),
+                },
+                "contracts": {
+                    "average_lifecycle_seconds_avg": round(self._average(bucket["contracts_lifecycle"]), 3),
+                    "count_avg": round(self._average(bucket["contracts_count"]), 3),
+                },
+            }
+            points.append(point)
+
+            series["agents_queue_length"].append({"t": point["bucket_start"], "v": point["agents"]["queue_length_avg"]})
+            series["agents_failure_rate"].append({"t": point["bucket_start"], "v": point["agents"]["failure_rate_avg"]})
+            series["agents_dispatch_latency_seconds"].append({"t": point["bucket_start"], "v": point["agents"]["dispatch_latency_seconds_avg"]})
+            series["decisions_pending"].append({"t": point["bucket_start"], "v": point["decisions"]["pending_count_avg"]})
+            series["decisions_overdue"].append({"t": point["bucket_start"], "v": point["decisions"]["overdue_count_avg"]})
+            series["contracts_average_lifecycle_seconds"].append({"t": point["bucket_start"], "v": point["contracts"]["average_lifecycle_seconds_avg"]})
+
+        return {
+            "generated_at": self._now_iso(),
+            "snapshot_type": snapshot_type,
+            "window": {
+                "hours": safe_hours,
+                "bucket_minutes": safe_bucket_minutes,
+                "start": start_dt.isoformat(),
+                "end": now_dt.isoformat(),
+            },
+            "point_count": len(points),
+            "points": points,
+            "series": series,
+        }
 
     def _maybe_capture_metrics_snapshot(self, force: bool = False) -> dict[str, Any] | None:
         now_iso = self._now_iso()

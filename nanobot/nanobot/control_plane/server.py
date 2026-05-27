@@ -234,6 +234,24 @@ def create_control_plane_app(
             "items": snapshots,
         }
 
+    @app.get("/api/control/metrics/timeseries")
+    async def metrics_timeseries(
+        hours: int = 24,
+        bucket_minutes: int = 5,
+        snapshot_type: str = "observability",
+    ) -> dict[str, Any]:
+        safe_hours = max(1, min(hours, 24 * 14))
+        safe_bucket_minutes = max(1, min(bucket_minutes, 60))
+        payload = manager.get_observability_timeseries(
+            hours=safe_hours,
+            bucket_minutes=safe_bucket_minutes,
+            snapshot_type=snapshot_type,
+        )
+        return {
+            "ok": True,
+            **payload,
+        }
+
     @app.get("/api/control/decisions/queue")
     async def decision_queue(limit: int = 200) -> dict[str, Any]:
         safe_limit = max(1, min(limit, 1000))
