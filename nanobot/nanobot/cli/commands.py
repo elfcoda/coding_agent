@@ -377,6 +377,11 @@ def gateway(
         revalidation_chain_enabled=config.agents.defaults.scheduler.revalidation_chain_enabled,
         revalidation_chain_edge_types=config.agents.defaults.scheduler.revalidation_chain_edge_types,
         revalidation_chain_max_depth=config.agents.defaults.scheduler.revalidation_chain_max_depth,
+        decision_sla_seconds=config.agents.defaults.scheduler.decision_sla_seconds,
+        decision_sla_block_scope=config.agents.defaults.scheduler.decision_sla_block_scope,
+        decision_queue_impact_weight=config.agents.defaults.scheduler.decision_queue_impact_weight,
+        decision_queue_age_weight=config.agents.defaults.scheduler.decision_queue_age_weight,
+        decision_default_degradation=config.agents.defaults.scheduler.decision_default_degradation,
     )
 
     # Set cron callback (needs agent)
@@ -497,6 +502,11 @@ def agent(
         revalidation_chain_enabled=config.agents.defaults.scheduler.revalidation_chain_enabled,
         revalidation_chain_edge_types=config.agents.defaults.scheduler.revalidation_chain_edge_types,
         revalidation_chain_max_depth=config.agents.defaults.scheduler.revalidation_chain_max_depth,
+        decision_sla_seconds=config.agents.defaults.scheduler.decision_sla_seconds,
+        decision_sla_block_scope=config.agents.defaults.scheduler.decision_sla_block_scope,
+        decision_queue_impact_weight=config.agents.defaults.scheduler.decision_queue_impact_weight,
+        decision_queue_age_weight=config.agents.defaults.scheduler.decision_queue_age_weight,
+        decision_default_degradation=config.agents.defaults.scheduler.decision_default_degradation,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on

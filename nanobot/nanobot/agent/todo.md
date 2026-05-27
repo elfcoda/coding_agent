@@ -16,45 +16,12 @@ scheduler 按属性+优先级并发派发 project agents。
 
 
 
-
+补一组最小化 pytest 用例，固定验证 SLA 阻塞、队列排序和三种降级策略。
+再加一个控制面命令接口，用于在线调整某个 work item 的 decision_degradation，方便人工实时接管策略。
 
 
 
 前端高亮受影响节点并要求人工确认。
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-人工决策优先级与超时策略（必须补）
-你强调人主导，后端要把 decision 作为一等公民：
-decision SLA（多久未决就阻塞哪些 agent）
-decision 队列优先级（影响面大的先推）
-未决时 agent 自动降级策略（返回 stub/等待/局部继续）
-
-动态 prompt 属性注入（必须补）
-你提到前端给 agent 附加属性后要编码到提示词。
-目前 registry 支持静态 prompt_hint，但缺少运行时覆盖。
-建议新增 agent_runtime_attributes 存储并在每次 delegate 时注入 system context。
-
-
-
-
-
-
-
 
 
 

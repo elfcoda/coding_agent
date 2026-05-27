@@ -143,6 +143,11 @@ class SchedulerConfig(BaseModel):
     revalidation_chain_enabled: bool = False
     revalidation_chain_edge_types: list[str] = Field(default_factory=lambda: ["requires_contract"])
     revalidation_chain_max_depth: int = 2
+    decision_sla_seconds: int = 1800
+    decision_sla_block_scope: str = "module"  # module | all | none
+    decision_queue_impact_weight: int = 10
+    decision_queue_age_weight: int = 1
+    decision_default_degradation: str = "wait"  # wait | stub | continue_partial
 
 
 class AgentDefaults(BaseModel):

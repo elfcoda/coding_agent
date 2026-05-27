@@ -71,6 +71,11 @@ class CoreAgentManager:
         revalidation_chain_enabled: bool = False,
         revalidation_chain_edge_types: list[str] | None = None,
         revalidation_chain_max_depth: int = 2,
+        decision_sla_seconds: int = 1800,
+        decision_sla_block_scope: str = "module",
+        decision_queue_impact_weight: int = 10,
+        decision_queue_age_weight: int = 1,
+        decision_default_degradation: str = "wait",
     ):
         from nanobot.config.schema import ExecToolConfig
 
@@ -94,6 +99,19 @@ class CoreAgentManager:
         edge_types = [str(item).strip() for item in (revalidation_chain_edge_types or ["requires_contract"]) if str(item).strip()]
         self._revalidation_chain_edge_types = set(edge_types or ["requires_contract"])
         self._revalidation_chain_max_depth = max(1, int(revalidation_chain_max_depth))
+        self._decision_sla_seconds = max(0, int(decision_sla_seconds))
+        scope = str(decision_sla_block_scope or "module").strip().lower()
+        if scope not in {"module", "all", "none"}:
+            scope = "module"
+        self._decision_sla_block_scope = scope
+        self._decision_queue_impact_weight = max(1, int(decision_queue_impact_weight))
+        self._decision_queue_age_weight = max(1, int(decision_queue_age_weight))
+        default_degradation = str(decision_default_degradation or "wait").strip().lower()
+        if default_degradation not in {"wait", "stub", "continue_partial"}:
+            default_degradation = "wait"
+        self._decision_default_degradation = default_degradation
+        self._decision_sla_blocked_modules: set[str] = set()
+        self._decision_sla_global_block = False
         self._reconciler_task: asyncio.Task[None] | None = None
         self._running_work_item_dispatches: dict[str, asyncio.Task[None]] = {}
         self._project_runtime_attributes: dict[str, dict[str, Any]] = {}
@@ -362,6 +380,122 @@ class CoreAgentManager:
         if not values:
             return 0.0
         return sum(values) / len(values)
+
+    @staticmethod
+    def _normalize_degradation_mode(value: Any, default: str = "wait") -> str:
+        mode = str(value or "").strip().lower() or default
+        if mode not in {"wait", "stub", "continue_partial"}:
+            return default
+        return mode
+
+    def _decision_age_seconds(self, decision: DecisionRecord, now_iso: str | None = None) -> float:
+        age = self._seconds_between(decision.created_at, now_iso or self._now_iso())
+        return float(age or 0.0)
+
+    def _decision_impact_size(self, work_item: WorkItemRecord | None) -> int:
+        if work_item is None:
+            return 1
+        downstream_edges = self.list_dependency_edges(
+            filters={"target_work_item_id": work_item.id, "status": "active"},
+            limit=500,
+        )
+        unresolved_contracts = self.list_contracts(
+            filters={"work_item_id": work_item.id},
+            limit=200,
+        )
+        unresolved_contract_count = len(
+            [contract for contract in unresolved_contracts if contract.status not in {"accepted", "implemented", "completed"}]
+        )
+        # Always include the decision owner work item itself as affected surface.
+        return 1 + len(downstream_edges) + unresolved_contract_count
+
+    def get_decision_queue(self, limit: int = 200) -> list[dict[str, Any]]:
+        now_iso = self._now_iso()
+        pending = self.list_decisions(filters={"status": "pending"}, limit=limit)
+        in_review = self.list_decisions(filters={"status": "in_review"}, limit=limit)
+        candidates = pending + in_review
+
+        entries: list[dict[str, Any]] = []
+        for decision in candidates:
+            work_item = self.get_work_item(decision.work_item_id)
+            impact_size = self._decision_impact_size(work_item)
+            age_seconds = self._decision_age_seconds(decision, now_iso)
+            overdue = bool(self._decision_sla_seconds > 0 and age_seconds >= self._decision_sla_seconds)
+            work_item_priority = int(work_item.priority) if work_item else 0
+            priority_score = (
+                impact_size * self._decision_queue_impact_weight
+                + int(age_seconds // 60) * self._decision_queue_age_weight
+                + work_item_priority
+                + (10_000 if overdue else 0)
+            )
+            entries.append(
+                {
+                    "decision_id": decision.id,
+                    "work_item_id": decision.work_item_id,
+                    "module": work_item.module if work_item else "",
+                    "decision_type": decision.decision_type,
+                    "status": decision.status,
+                    "age_seconds": round(age_seconds, 3),
+                    "impact_size": impact_size,
+                    "work_item_priority": work_item_priority,
+                    "sla_seconds": self._decision_sla_seconds,
+                    "sla_overdue": overdue,
+                    "priority_score": int(priority_score),
+                    "degradation_mode": self._resolve_work_item_degradation_strategy(work_item, [decision]),
+                }
+            )
+
+        entries.sort(
+            key=lambda item: (
+                -int(item["priority_score"]),
+                -int(item["impact_size"]),
+                -float(item["age_seconds"]),
+                str(item["decision_id"]),
+            )
+        )
+        for index, item in enumerate(entries, start=1):
+            item["queue_rank"] = index
+        return entries[:limit]
+
+    def _resolve_work_item_degradation_strategy(
+        self,
+        work_item: WorkItemRecord | None,
+        pending_decisions: list[DecisionRecord],
+    ) -> str:
+        mode = self._decision_default_degradation
+        if work_item is not None:
+            scheduler_meta = dict(work_item.metadata.get("scheduler", {}))
+            configured = scheduler_meta.get("decision_degradation")
+            if configured is not None:
+                mode = self._normalize_degradation_mode(configured, default=mode)
+
+        for decision in pending_decisions:
+            meta = dict(decision.metadata or {})
+            configured = meta.get("degradation_mode") or meta.get("degradation_policy")
+            if configured is not None:
+                mode = self._normalize_degradation_mode(configured, default=mode)
+
+        return mode
+
+    def _refresh_decision_controls(self, limit: int = 500) -> dict[str, Any]:
+        queue = self.get_decision_queue(limit=limit)
+        overdue_entries = [item for item in queue if bool(item.get("sla_overdue"))]
+        blocked_modules = {str(item.get("module") or "").strip() for item in overdue_entries if str(item.get("module") or "").strip()}
+
+        self._decision_sla_blocked_modules = blocked_modules if self._decision_sla_block_scope == "module" else set()
+        self._decision_sla_global_block = bool(overdue_entries) and self._decision_sla_block_scope == "all"
+
+        summary = {
+            "decision_sla_seconds": self._decision_sla_seconds,
+            "decision_sla_block_scope": self._decision_sla_block_scope,
+            "pending_count": len(queue),
+            "overdue_count": len(overdue_entries),
+            "blocked_modules": sorted(self._decision_sla_blocked_modules),
+            "global_blocked": self._decision_sla_global_block,
+            "queue": queue,
+        }
+        self._emit_workflow_event("workflow.decision.queue.updated", summary)
+        return summary
 
     @staticmethod
     def _is_contract_terminal(status: str) -> bool:
@@ -960,14 +1094,26 @@ class CoreAgentManager:
 
     def run_workflow_scheduler_tick(self, limit: int = 200) -> dict[str, Any]:
         """Reconcile workflow state and return transitions for UI/scheduler loops."""
+        decision_control = self._refresh_decision_controls(limit=max(200, limit * 3))
         work_items = self.list_work_items(limit=limit)
         transitions: list[dict[str, Any]] = []
 
         for work_item in work_items:
             blockers: list[str] = []
             decisions = self.list_decisions(filters={"work_item_id": work_item.id}, limit=100)
-            if any(decision.status in {"pending", "in_review"} for decision in decisions):
+            pending_decisions = [decision for decision in decisions if decision.status in {"pending", "in_review"}]
+            if pending_decisions:
                 blockers.append("pending_decision")
+
+            pending_ages = [self._decision_age_seconds(decision) for decision in pending_decisions]
+            max_pending_age = max(pending_ages) if pending_ages else 0.0
+            sla_overdue = bool(
+                pending_decisions
+                and self._decision_sla_seconds > 0
+                and max_pending_age >= self._decision_sla_seconds
+            )
+            if sla_overdue:
+                blockers.append("pending_decision_sla")
 
             edges = self.list_dependency_edges(filters={"source_work_item_id": work_item.id, "status": "active"}, limit=100)
             for edge in edges:
@@ -998,9 +1144,16 @@ class CoreAgentManager:
             blockers.extend([f"contract:{item}" for item in unresolved_contracts])
 
             desired_status = work_item.status
-            desired_decision_required = any(decision.status in {"pending", "in_review"} for decision in decisions)
+            desired_decision_required = bool(pending_decisions)
+            degradation_mode = self._resolve_work_item_degradation_strategy(work_item, pending_decisions)
+            non_decision_blockers = [item for item in blockers if item not in {"pending_decision", "pending_decision_sla"}]
             if desired_decision_required:
-                desired_status = "waiting_decision"
+                if degradation_mode == "continue_partial" and not non_decision_blockers:
+                    desired_status = "ready"
+                elif degradation_mode == "stub":
+                    desired_status = "blocked"
+                else:
+                    desired_status = "waiting_decision"
             elif blockers:
                 desired_status = "blocked"
             elif work_item.status in {"proposed", "blocked", "waiting_decision"}:
@@ -1010,6 +1163,9 @@ class CoreAgentManager:
                 scheduler_updates: dict[str, Any] = {"state": "reconciled"}
                 if desired_status == "ready":
                     scheduler_updates["ready_since"] = work_item.metadata.get("scheduler", {}).get("ready_since", self._now_iso())
+                scheduler_updates["decision_degradation_mode"] = degradation_mode
+                scheduler_updates["decision_pending_max_age_seconds"] = round(max_pending_age, 3)
+                scheduler_updates["decision_sla_overdue"] = sla_overdue
                 updated = self.update_work_item(
                     work_item.id,
                     {
@@ -1030,6 +1186,14 @@ class CoreAgentManager:
         summary = {
             "checked": len(work_items),
             "transitions": transitions,
+            "decision_control": {
+                "pending_count": decision_control["pending_count"],
+                "overdue_count": decision_control["overdue_count"],
+                "decision_sla_seconds": decision_control["decision_sla_seconds"],
+                "decision_sla_block_scope": decision_control["decision_sla_block_scope"],
+                "blocked_modules": decision_control["blocked_modules"],
+                "global_blocked": decision_control["global_blocked"],
+            },
         }
         self._emit_workflow_event("workflow.scheduler.tick", summary)
         return summary
@@ -1045,6 +1209,7 @@ class CoreAgentManager:
         work_items = self.list_work_items(limit=limit)
         contracts = self.list_contracts(limit=limit)
         decisions = self.list_decisions(limit=limit)
+        decision_queue = self.get_decision_queue(limit=limit)
 
         now_iso = self._now_iso()
         agent_modules = sorted({item.module for item in work_items})
@@ -1128,9 +1293,13 @@ class CoreAgentManager:
             },
             "decisions": {
                 "count": len(decision_items),
+                "pending_count": len(decision_queue),
+                "overdue_count": len([item for item in decision_queue if bool(item.get("sla_overdue"))]),
+                "decision_sla_seconds": self._decision_sla_seconds,
                 "average_turnaround_seconds": round(self._average(decision_durations), 3),
                 "max_turnaround_seconds": round(max(decision_durations), 3) if decision_durations else 0.0,
                 "items": decision_items,
+                "queue": decision_queue,
             },
         }
 
@@ -1266,6 +1435,15 @@ class CoreAgentManager:
         skipped: list[dict[str, str]] = []
         selected: list[dict[str, Any]] = []
         available_slots = max(0, self._scheduler_max_concurrent_dispatches - len(self._running_work_item_dispatches))
+
+        if self._decision_sla_global_block:
+            skipped.extend(
+                [{"work_item_id": item.id, "reason": "decision_sla_global_block"} for item in ready_items]
+            )
+        elif self._decision_sla_blocked_modules:
+            for item in ready_items:
+                if item.module in self._decision_sla_blocked_modules:
+                    skipped.append({"work_item_id": item.id, "reason": "decision_sla_module_block"})
 
         for entry in plan:
             if available_slots <= 0:
@@ -1819,6 +1997,10 @@ class CoreAgentManager:
         plan: list[dict[str, Any]] = []
         for item in ready_items:
             if item.module not in self._allowed_project_scopes:
+                continue
+            if self._decision_sla_global_block:
+                continue
+            if item.module in self._decision_sla_blocked_modules:
                 continue
 
             profile = self._project_scheduler_profile(item.module)

@@ -172,6 +172,17 @@ def create_control_plane_app(manager: CoreAgentManager) -> FastAPI:
             "decisions": payload["decisions"],
         }
 
+    @app.get("/api/control/decisions/queue")
+    async def decision_queue(limit: int = 200) -> dict[str, Any]:
+        safe_limit = max(1, min(limit, 1000))
+        queue = manager.get_decision_queue(limit=safe_limit)
+        return {
+            "ok": True,
+            "generated_at": _now_utc_iso(),
+            "count": len(queue),
+            "queue": queue,
+        }
+
     @app.post("/api/control/workflow/manage")
     async def manage_workflow(request: WorkflowManageRequest) -> dict[str, Any]:
         try:
