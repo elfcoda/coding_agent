@@ -160,6 +160,47 @@ Open http://localhost:5000 and start asking questions about your code! 🎉
 
 ---
 
+## 🔧 Nanobot Real-Time Decision Override API
+
+When a work item is waiting on a human decision, operations or frontend tools can override its runtime degradation mode in real time.
+
+Control plane command:
+
+- Method: POST
+- Path: /api/control/commands/work-items/{work_item_id}/decision-degradation
+- Allowed values:
+  - wait
+  - stub
+  - continue_partial
+
+Example request body:
+
+```json
+{
+  "decision_degradation": "continue_partial"
+}
+```
+
+Example curl calls:
+
+```bash
+# 1) Check prioritized decision queue
+curl -s "http://127.0.0.1:18790/api/control/decisions/queue?limit=20"
+
+# 2) Override one work item degradation mode in real time
+curl -s -X POST "http://127.0.0.1:18790/api/control/commands/work-items/<WORK_ITEM_ID>/decision-degradation" \
+  -H "Content-Type: application/json" \
+  -d '{"decision_degradation":"continue_partial"}'
+```
+
+Tips:
+
+- wait keeps the item in waiting_decision.
+- stub keeps the item blocked and allows stub-first collaboration.
+- continue_partial allows local progress when there are no other blockers.
+
+---
+
 ## 📦 Installation
 
 FastCode supports **Linux**, **macOS**, and **Windows**. Choose your platform below:

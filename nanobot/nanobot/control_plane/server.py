@@ -94,6 +94,12 @@ class SubmitDecisionCommandRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class UpdateDecisionDegradationCommandRequest(BaseModel):
+    """Direct command for updating one work item's decision degradation mode."""
+
+    decision_degradation: str = Field(description="wait | stub | continue_partial")
+
+
 def _json_or_text(value: str) -> Any:
     try:
         return json.loads(value)
@@ -264,6 +270,44 @@ def create_control_plane_app(manager: CoreAgentManager) -> FastAPI:
                 "ok": True,
                 "decision": asdict(created),
             }
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/control/commands/work-items/{work_item_id}/decision-degradation")
+    async def command_update_work_item_decision_degradation(
+        work_item_id: str,
+        request: UpdateDecisionDegradationCommandRequest,
+    ) -> dict[str, Any]:
+        try:
+            mode = str(request.decision_degradation or "").strip().lower()
+            if mode not in {"wait", "stub", "continue_partial"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="decision_degradation must be one of: wait, stub, continue_partial",
+                )
+
+            current = manager.get_work_item(work_item_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail=f"Unknown work item id: {work_item_id}")
+
+            metadata = dict(current.metadata)
+            scheduler_meta = dict(metadata.get("scheduler", {}))
+            scheduler_meta["decision_degradation"] = mode
+            metadata["scheduler"] = scheduler_meta
+
+            updated = manager.update_work_item(
+                work_item_id,
+                {
+                    "metadata": metadata,
+                },
+            )
+            return {
+                "ok": True,
+                "work_item": asdict(updated),
+                "decision_degradation": mode,
+            }
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -11,18 +11,22 @@
 
 最小可跑通的完整 demo 后端定义（建议你以这个为目标）
 
-scheduler 按属性+优先级并发派发 project agents。
-任一 contract 版本变化触发链式 revalidation
 
 
 
-补一组最小化 pytest 用例，固定验证 SLA 阻塞、队列排序和三种降级策略。
-再加一个控制面命令接口，用于在线调整某个 work item 的 decision_degradation，方便人工实时接管策略。
 
 
 
-前端高亮受影响节点并要求人工确认。
 
+
+前端高亮受影响节点并要求人工确认
+
+
+仍建议补的“收尾项”（不影响 demo 主链路）
+
+增加一个端到端冒烟脚本：从 API 创建任务到 contract 合并、decision、revalidation、metrics 拉取的一次性回归。
+指标目前偏“实时聚合快照”，如要长期运营看板，建议加时间序列落库（例如每分钟采样）。
+为控制面 API 增加鉴权/限流（demo 可不做，生产必须做）。
 
 
 
