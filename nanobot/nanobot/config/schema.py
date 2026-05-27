@@ -111,6 +111,7 @@ class WorkflowWSConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 18791
     path: str = "/workflow"
+    replay_buffer_size: int = 2000
 
 
 class ChannelsConfig(BaseModel):

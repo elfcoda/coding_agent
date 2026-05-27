@@ -8,6 +8,7 @@ import json
 import re
 from collections import deque
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -326,6 +327,149 @@ class CoreAgentManager:
             seen.add(value)
             result.append(value)
         return result
+
+    def _mergeable_contract_candidate(self, fields: dict[str, Any]) -> ContractRecord | None:
+        """Find an existing pending contract request that can absorb a duplicate request."""
+        status = str(fields.get("status", "requested"))
+        if status not in {"requested", "draft", "in_review"}:
+            return None
+
+        if not bool(fields.get("dedupe_request", True)):
+            return None
+
+        provider_module = str(fields.get("provider_module") or "")
+        consumer_module = str(fields.get("consumer_module") or "")
+        interface_name = str(fields.get("interface_name") or "")
+        requested_version = int(fields.get("version", 1))
+
+        if not provider_module or not consumer_module or not interface_name:
+            return None
+
+        candidates = self.list_contracts(
+            filters={
+                "provider_module": provider_module,
+                "consumer_module": consumer_module,
+                "interface_name": interface_name,
+            },
+            limit=200,
+        )
+        for candidate in candidates:
+            if candidate.status not in {"requested", "draft", "in_review"}:
+                continue
+            if int(candidate.version) != requested_version:
+                continue
+            return candidate
+        return None
+
+    def _merge_contract_request(self, existing: ContractRecord, fields: dict[str, Any]) -> ContractRecord:
+        """Merge duplicated contract requests into one canonical pending contract."""
+        metadata = dict(existing.metadata)
+
+        incoming_work_item_id = str(fields.get("work_item_id") or "").strip()
+        incoming_consumer_work_item_id = str(fields.get("consumer_work_item_id") or "").strip()
+        incoming_provider_work_item_id = str(fields.get("provider_work_item_id") or "").strip()
+
+        merged_work_item_ids = self._unique_list(
+            [str(item).strip() for item in metadata.get("merged_work_item_ids", []) if str(item).strip()]
+            + ([existing.work_item_id] if str(existing.work_item_id).strip() else [])
+            + ([incoming_work_item_id] if incoming_work_item_id else [])
+        )
+        merged_consumer_work_item_ids = self._unique_list(
+            [str(item).strip() for item in metadata.get("merged_consumer_work_item_ids", []) if str(item).strip()]
+            + ([incoming_consumer_work_item_id] if incoming_consumer_work_item_id else [])
+        )
+        merged_provider_work_item_ids = self._unique_list(
+            [str(item).strip() for item in metadata.get("merged_provider_work_item_ids", []) if str(item).strip()]
+            + ([incoming_provider_work_item_id] if incoming_provider_work_item_id else [])
+        )
+
+        merged_request_count = int(metadata.get("merged_request_count", 1)) + 1
+        merged_at = datetime.now().isoformat()
+        incoming_request_source = dict(fields.get("request_source") or {})
+        if not incoming_request_source:
+            for key in ("session_key", "channel", "chat_id", "requested_by"):
+                value = str(fields.get(key) or "").strip()
+                if value:
+                    incoming_request_source[key] = value
+
+        merge_audit = dict(metadata.get("merge_audit") or {})
+        entries = [dict(item) for item in merge_audit.get("entries", []) if isinstance(item, dict)]
+        next_seq = len(entries) + 1
+        entry = {
+            "seq": next_seq,
+            "merged_at": merged_at,
+            "canonical_contract_id": existing.id,
+            "incoming_request": {
+                "provider_module": str(fields.get("provider_module") or existing.provider_module),
+                "consumer_module": str(fields.get("consumer_module") or existing.consumer_module),
+                "interface_name": str(fields.get("interface_name") or existing.interface_name),
+                "version": int(fields.get("version", existing.version)),
+                "status": str(fields.get("status", "requested")),
+                "work_item_id": incoming_work_item_id,
+                "consumer_work_item_id": incoming_consumer_work_item_id,
+                "provider_work_item_id": incoming_provider_work_item_id,
+                "source": incoming_request_source,
+            },
+        }
+        entries.append(entry)
+        merge_audit.update(
+            {
+                "canonical_contract_id": existing.id,
+                "first_seen_at": str(merge_audit.get("first_seen_at") or existing.created_at),
+                "last_merged_at": merged_at,
+                "total_merged_requests": merged_request_count,
+                "entries": entries,
+            }
+        )
+
+        metadata.update(
+            {
+                "merged_request_count": merged_request_count,
+                "merged_work_item_ids": merged_work_item_ids,
+                "merged_consumer_work_item_ids": merged_consumer_work_item_ids,
+                "merged_provider_work_item_ids": merged_provider_work_item_ids,
+                "dedupe_mode": "request_merge",
+                "last_merged_at": merged_at,
+                "merge_audit": merge_audit,
+            }
+        )
+
+        changes: dict[str, Any] = {
+            "metadata": metadata,
+        }
+        incoming_spec = dict(fields.get("spec", {}))
+        if not existing.spec and incoming_spec:
+            changes["spec"] = incoming_spec
+        incoming_stub_path = str(fields.get("stub_path") or "")
+        if not existing.stub_path and incoming_stub_path:
+            changes["stub_path"] = incoming_stub_path
+        incoming_implementation_path = str(fields.get("implementation_path") or "")
+        if not existing.implementation_path and incoming_implementation_path:
+            changes["implementation_path"] = incoming_implementation_path
+        if not str(existing.work_item_id).strip() and incoming_work_item_id:
+            changes["work_item_id"] = incoming_work_item_id
+
+        updated = self.workflow_store.update_contract(existing.id, **changes)
+        self._emit_workflow_event("workflow.contract.updated", self._serialize_workflow_record(updated))
+        self._apply_contract_side_effects(updated, fields)
+        self._emit_workflow_event(
+            "workflow.contract.request.deduped",
+            {
+                "contract_id": updated.id,
+                "provider_module": updated.provider_module,
+                "consumer_module": updated.consumer_module,
+                "interface_name": updated.interface_name,
+                "version": updated.version,
+                "merged_request_count": merged_request_count,
+                "merged_at": merged_at,
+                "merge_entry_seq": next_seq,
+                "incoming_work_item_id": incoming_work_item_id,
+                "incoming_consumer_work_item_id": incoming_consumer_work_item_id,
+                "incoming_provider_work_item_id": incoming_provider_work_item_id,
+                "incoming_request_source": incoming_request_source,
+            },
+        )
+        return updated
 
     def _find_latest_work_item_for_module(self, module: str) -> WorkItemRecord | None:
         items = self.list_work_items(filters={"module": module}, limit=50)
@@ -1067,6 +1211,18 @@ class CoreAgentManager:
         return deleted
 
     def create_contract(self, fields: dict[str, Any]) -> ContractRecord:
+        existing = self._mergeable_contract_candidate(fields)
+        if existing is not None:
+            # 同一语义接口被重复请求：比如 provider_module、consumer_module、interface_name、version 一样，且都处于 requested/draft 这类未定稿状态。
+            # 并发扇出导致重复：module1 和 module2 几乎同时向 module3 请求同一接口，或者重试机制触发重复创建。
+            # 人工决策窗口内多次提交：前端还没审阅完，后端又收到内容相近的新请求，这时更适合并入同一条 contract。
+            # 目标是一个“共享接口”而不是多份分支协议：如果本质是同一 API 契约，就该合并；如果是不同版本/不同边界，就不该合并。
+            #
+            # 决策对象更少，评审更快。
+            # 变更传播更稳定，不会因为多条重复 contract 出现不一致。
+            # 审计更清晰，可以追踪“谁的请求被合并进来了（由audit实现）。
+            return self._merge_contract_request(existing, fields)
+
         record = ContractRecord(
             id=str(fields.get("id") or uuid.uuid4())[:36],
             provider_module=str(fields["provider_module"]),
@@ -1098,6 +1254,52 @@ class CoreAgentManager:
             work_item_id=filters.get("work_item_id"),
             limit=limit,
         )
+
+    def get_contract_merge_audit(self, contract_id: str) -> dict[str, Any] | None:
+        """Return one contract's merge audit view for UI/decision auditing."""
+        contract = self.get_contract(contract_id)
+        if contract is None:
+            return None
+
+        metadata = dict(contract.metadata or {})
+        merge_audit = dict(metadata.get("merge_audit") or {})
+        entries = [dict(item) for item in merge_audit.get("entries", []) if isinstance(item, dict)]
+
+        merged_request_count = int(metadata.get("merged_request_count", 1))
+        return {
+            "contract_id": contract.id,
+            "provider_module": contract.provider_module,
+            "consumer_module": contract.consumer_module,
+            "interface_name": contract.interface_name,
+            "version": contract.version,
+            "status": contract.status,
+            "merged_request_count": merged_request_count,
+            "dedupe_mode": metadata.get("dedupe_mode", "none"),
+            "first_seen_at": str(merge_audit.get("first_seen_at") or contract.created_at),
+            "last_merged_at": str(merge_audit.get("last_merged_at") or metadata.get("last_merged_at") or ""),
+            "merged_work_item_ids": [str(item) for item in metadata.get("merged_work_item_ids", [])],
+            "merged_consumer_work_item_ids": [str(item) for item in metadata.get("merged_consumer_work_item_ids", [])],
+            "merged_provider_work_item_ids": [str(item) for item in metadata.get("merged_provider_work_item_ids", [])],
+            "entries": entries,
+        }
+
+    def list_contract_merge_audits(
+        self,
+        filters: dict[str, Any] | None = None,
+        limit: int = 100,
+        merged_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """List merge audit views over contracts, optionally merged-only."""
+        contracts = self.list_contracts(filters=filters or {}, limit=limit)
+        views: list[dict[str, Any]] = []
+        for contract in contracts:
+            view = self.get_contract_merge_audit(contract.id)
+            if view is None:
+                continue
+            if merged_only and int(view.get("merged_request_count", 1)) <= 1:
+                continue
+            views.append(view)
+        return views
 
     def update_contract(self, record_id: str, changes: dict[str, Any]) -> ContractRecord:
         previous = self.get_contract(record_id)

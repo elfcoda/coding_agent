@@ -148,6 +148,47 @@ def create_control_plane_app(manager: CoreAgentManager) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.get("/api/control/contracts/merge-audit")
+    async def contract_merge_audit_list(
+        provider_module: str | None = None,
+        consumer_module: str | None = None,
+        interface_name: str | None = None,
+        status: str | None = None,
+        limit: int = 200,
+        merged_only: bool = True,
+    ) -> dict[str, Any]:
+        safe_limit = max(1, min(limit, 1000))
+        filters: dict[str, Any] = {}
+        if provider_module:
+            filters["provider_module"] = provider_module
+        if consumer_module:
+            filters["consumer_module"] = consumer_module
+        if interface_name:
+            filters["interface_name"] = interface_name
+        if status:
+            filters["status"] = status
+
+        records = manager.list_contract_merge_audits(
+            filters=filters,
+            limit=safe_limit,
+            merged_only=merged_only,
+        )
+        return {
+            "ok": True,
+            "count": len(records),
+            "records": records,
+        }
+
+    @app.get("/api/control/contracts/{contract_id}/merge-audit")
+    async def contract_merge_audit_get(contract_id: str) -> dict[str, Any]:
+        record = manager.get_contract_merge_audit(contract_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"Unknown contract id: {contract_id}")
+        return {
+            "ok": True,
+            "record": record,
+        }
+
     @app.get("/api/control/delegation/batch/{batch_id}")
     async def delegation_batch_status(batch_id: str) -> dict[str, Any]:
         try:

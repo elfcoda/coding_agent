@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -33,6 +34,10 @@ class WorkflowWSChannel(BaseChannel):
         self._stop_event = asyncio.Event()
         self._clients: dict[Any, _ClientSubscription] = {}
         self._clients_lock = asyncio.Lock()
+        self._events_lock = asyncio.Lock()
+        self._event_cursor = 0
+        max_events = max(100, int(self.config.replay_buffer_size))
+        self._event_buffer: deque[dict[str, Any]] = deque(maxlen=max_events)
 
     async def start(self) -> None:
         """Start workflow WebSocket server and keep serving until stopped."""
@@ -95,6 +100,11 @@ class WorkflowWSChannel(BaseChannel):
             "payload": payload.get("payload", payload),
         }
 
+        async with self._events_lock:
+            self._event_cursor += 1
+            envelope["cursor"] = self._event_cursor
+            self._event_buffer.append(dict(envelope))
+
         body = json.dumps(envelope, ensure_ascii=False)
         to_remove: list[Any] = []
 
@@ -130,7 +140,8 @@ class WorkflowWSChannel(BaseChannel):
                         "type": "workflow.connected",
                         "payload": {
                             "path": self.config.path,
-                            "hint": "Send {'type':'subscribe','event_types':['workflow.scheduler.tick']} to filter events",
+                            "latest_cursor": await self._latest_cursor(),
+                            "hint": "Send {'type':'subscribe','event_types':['workflow.scheduler.tick'],'since_cursor':123} to resume from a cursor",
                         },
                     },
                     ensure_ascii=False,
@@ -166,19 +177,51 @@ class WorkflowWSChannel(BaseChannel):
                 )
                 return
 
+            since_cursor_raw = command.get("since_cursor", 0)
+            try:
+                since_cursor = max(0, int(since_cursor_raw))
+            except (TypeError, ValueError):
+                await websocket.send(
+                    json.dumps({"type": "workflow.error", "payload": {"error": "since_cursor_must_be_int"}})
+                )
+                return
+
             event_types = {str(item).strip() for item in values if str(item).strip()}
+            subscription = _ClientSubscription(event_types=event_types)
             async with self._clients_lock:
                 if websocket in self._clients:
-                    self._clients[websocket] = _ClientSubscription(event_types=event_types)
+                    self._clients[websocket] = subscription
+
+            replayed = await self._replay_events(websocket, subscription, since_cursor)
+            latest_cursor = await self._latest_cursor()
 
             await websocket.send(
                 json.dumps(
                     {
                         "type": "workflow.subscribed",
-                        "payload": {"event_types": sorted(event_types)},
+                        "payload": {
+                            "event_types": sorted(event_types),
+                            "since_cursor": since_cursor,
+                            "replayed": replayed,
+                            "latest_cursor": latest_cursor,
+                        },
                     },
                     ensure_ascii=False,
                 )
+            )
+            return
+
+        if kind == "resume":
+            await self._handle_client_command(
+                websocket,
+                json.dumps(
+                    {
+                        "type": "subscribe",
+                        "event_types": command.get("event_types", []),
+                        "since_cursor": command.get("since_cursor", 0),
+                    },
+                    ensure_ascii=False,
+                ),
             )
             return
 
@@ -191,3 +234,21 @@ class WorkflowWSChannel(BaseChannel):
                 ensure_ascii=False,
             )
         )
+
+    async def _latest_cursor(self) -> int:
+        async with self._events_lock:
+            return self._event_cursor
+
+    async def _replay_events(self, websocket: Any, subscription: _ClientSubscription, since_cursor: int) -> int:
+        """Replay buffered events newer than cursor for reconnect/resume clients."""
+        async with self._events_lock:
+            replay = [dict(item) for item in self._event_buffer if int(item.get("cursor", 0)) > since_cursor]
+
+        sent = 0
+        for envelope in replay:
+            event_type = str(envelope.get("type") or "")
+            if subscription.event_types and event_type not in subscription.event_types:
+                continue
+            await websocket.send(json.dumps(envelope, ensure_ascii=False))
+            sent += 1
+        return sent
