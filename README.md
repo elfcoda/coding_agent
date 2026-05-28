@@ -199,6 +199,76 @@ Tips:
 - stub keeps the item blocked and allows stub-first collaboration.
 - continue_partial allows local progress when there are no other blockers.
 
+### Recommended Defaults by Task Type
+
+Use the following defaults when selecting `decision_degradation` for a work item:
+
+| Task Type | Default Mode | Why |
+|---|---|---|
+| Cross-module API/Contract design | `stub` | Keep upstream/downstream teams unblocked while final interface decisions are pending. |
+| New feature implementation (clear scope) | `continue_partial` | Execute independent sub-tasks first and reduce idle waiting time. |
+| Large refactor (call-chain impact) | `wait` | High regression risk and rollback cost require explicit human confirmation. |
+| Small internal refactor | `continue_partial` | Most work is reversible and can proceed safely before final approval. |
+| Production incident hotfix | `continue_partial` | Prioritize containment and partial recovery while decisions converge. |
+| Performance optimization | `continue_partial` | Benchmarking/instrumentation can proceed before final strategy selection. |
+| Database schema migration | `wait` | Potentially irreversible data and compatibility impact. |
+| Release, rollout, or rollback decision | `wait` | Production safety gate should remain human-controlled. |
+| Security-sensitive changes (auth/permissions/keys) | `wait` | Compliance and risk posture require strict approval. |
+| External dependency major upgrade | `wait` | Compatibility uncertainty is high; decide first, execute second. |
+| External dependency patch upgrade | `continue_partial` | Validation and compatibility checks can proceed early. |
+| Test engineering / test infra | `continue_partial` | Low risk and usually parallelizable. |
+| Documentation / observability dashboards | `continue_partial` | Very low blast radius and high immediate value. |
+| Cross-team integration during interface churn | `stub` | Use placeholder collaboration to maintain delivery flow. |
+
+Quick policy:
+
+- Choose `wait` for high-risk or irreversible actions.
+- Choose `stub` for cross-team interface dependency waiting.
+- Choose `continue_partial` for decomposable, low-risk, reversible tasks.
+
+### Frontend Default Value Strategy (Tag -> Mode)
+
+For UI forms, you can auto-select `decision_degradation` from task tags, then allow manual override before submit.
+
+Suggested priority order:
+
+1. User manual choice in form (highest priority)
+2. Explicit policy tag match
+3. Task-type fallback table above
+4. System default (`wait`)
+
+Suggested tag mapping:
+
+| Tags (any match) | Auto-selected mode |
+|---|---|
+| `release`, `migration`, `security`, `auth`, `permission`, `compliance`, `rollback` | `wait` |
+| `contract`, `api-design`, `interface`, `integration`, `cross-team` | `stub` |
+| `feature`, `refactor-small`, `hotfix`, `perf`, `test`, `docs`, `dashboard` | `continue_partial` |
+
+Recommended control-plane call sequence (matches current APIs):
+
+1. Create work item:
+  - `POST /api/control/commands/work-items/create`
+2. Get `work_item_id` from response.
+3. Apply selected mode:
+  - `POST /api/control/commands/work-items/{work_item_id}/decision-degradation`
+  - Body: `{"decision_degradation":"wait|stub|continue_partial"}`
+4. Optional verification:
+  - `GET /api/control/snapshot` and inspect `work_items[].metadata.scheduler.decision_degradation`
+
+Example (frontend-side pseudo logic):
+
+```ts
+function pickDecisionDegradation(tags: string[], manual?: string): "wait" | "stub" | "continue_partial" {
+  if (manual === "wait" || manual === "stub" || manual === "continue_partial") return manual;
+  const t = new Set(tags.map((x) => x.toLowerCase()));
+  if (["release", "migration", "security", "auth", "permission", "compliance", "rollback"].some((x) => t.has(x))) return "wait";
+  if (["contract", "api-design", "interface", "integration", "cross-team"].some((x) => t.has(x))) return "stub";
+  if (["feature", "refactor-small", "hotfix", "perf", "test", "docs", "dashboard"].some((x) => t.has(x))) return "continue_partial";
+  return "wait";
+}
+```
+
 ---
 
 ## 🛡 Control Plane Security and Metrics History

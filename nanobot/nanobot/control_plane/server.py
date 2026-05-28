@@ -239,13 +239,16 @@ def create_control_plane_app(
         hours: int = 24,
         bucket_minutes: int = 5,
         snapshot_type: str = "observability",
+        modules: str | None = None,
     ) -> dict[str, Any]:
         safe_hours = max(1, min(hours, 24 * 14))
         safe_bucket_minutes = max(1, min(bucket_minutes, 60))
+        module_list = [item.strip() for item in str(modules or "").split(",") if item.strip()]
         payload = manager.get_observability_timeseries(
             hours=safe_hours,
             bucket_minutes=safe_bucket_minutes,
             snapshot_type=snapshot_type,
+            modules=module_list,
         )
         return {
             "ok": True,

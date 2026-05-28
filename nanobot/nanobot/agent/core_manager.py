@@ -1324,9 +1324,12 @@ class CoreAgentManager:
         hours: int = 24,
         bucket_minutes: int = 5,
         snapshot_type: str = "observability",
+        modules: list[str] | None = None,
     ) -> dict[str, Any]:
         safe_hours = max(1, min(hours, 24 * 14))
         safe_bucket_minutes = max(1, min(bucket_minutes, 60))
+        normalized_modules = sorted({str(item).strip().lower() for item in (modules or []) if str(item).strip()})
+        module_filter = set(normalized_modules)
         now_dt = datetime.now(timezone.utc)
         start_dt = now_dt - timedelta(hours=safe_hours)
         bucket_seconds = safe_bucket_minutes * 60
@@ -1335,6 +1338,8 @@ class CoreAgentManager:
 
         snapshots = self.list_observability_snapshots(limit=snapshot_limit, snapshot_type=snapshot_type)
         buckets: dict[int, dict[str, Any]] = {}
+        available_modules: set[str] = set()
+        module_buckets: dict[str, dict[int, dict[str, Any]]] = {}
 
         for row in snapshots:
             metrics = dict(row.get("metrics") or {})
@@ -1348,7 +1353,16 @@ class CoreAgentManager:
             ts = int(dt.timestamp())
             bucket_epoch = ts - (ts % bucket_seconds)
 
-            agents = [dict(item) for item in metrics.get("agents", []) if isinstance(item, dict)]
+            all_agents = [dict(item) for item in metrics.get("agents", []) if isinstance(item, dict)]
+            for agent in all_agents:
+                module_name = str(agent.get("module", "")).strip().lower()
+                if module_name:
+                    available_modules.add(module_name)
+
+            agents = all_agents
+            if module_filter:
+                agents = [item for item in all_agents if str(item.get("module", "")).strip().lower() in module_filter]
+
             decisions = dict(metrics.get("decisions") or {})
             contracts = dict(metrics.get("contracts") or {})
 
@@ -1392,6 +1406,42 @@ class CoreAgentManager:
             bucket["contracts_lifecycle"].append(float(contract_lifecycle))
             bucket["contracts_count"].append(float(contract_count))
 
+            module_groups: dict[str, list[dict[str, Any]]] = {}
+            for agent in all_agents:
+                module_name = str(agent.get("module", "")).strip().lower()
+                if not module_name:
+                    continue
+                if module_filter and module_name not in module_filter:
+                    continue
+                module_groups.setdefault(module_name, []).append(agent)
+
+            for module_name, grouped_agents in module_groups.items():
+                per_module = module_buckets.setdefault(module_name, {})
+                module_bucket = per_module.setdefault(
+                    bucket_epoch,
+                    {
+                        "queue": [],
+                        "running": [],
+                        "failure_rate": [],
+                        "dispatch_latency": [],
+                    },
+                )
+                module_attempts = sum(int(item.get("dispatch_attempts", 0)) for item in grouped_agents)
+                module_failures = sum(int(item.get("dispatch_failures", 0)) for item in grouped_agents)
+                module_queue = sum(int(item.get("queue_length", 0)) for item in grouped_agents)
+                module_running = sum(int(item.get("running_count", 0)) for item in grouped_agents)
+                module_failure_rate = (
+                    (module_failures / module_attempts)
+                    if module_attempts
+                    else self._average([float(item.get("failure_rate", 0.0)) for item in grouped_agents])
+                )
+                module_dispatch_latency = self._average([float(item.get("dispatch_latency_seconds_avg", 0.0)) for item in grouped_agents])
+
+                module_bucket["queue"].append(float(module_queue))
+                module_bucket["running"].append(float(module_running))
+                module_bucket["failure_rate"].append(float(module_failure_rate))
+                module_bucket["dispatch_latency"].append(float(module_dispatch_latency))
+
         ordered_epochs = sorted(buckets.keys())
         points: list[dict[str, Any]] = []
         series = {
@@ -1401,6 +1451,14 @@ class CoreAgentManager:
             "decisions_pending": [],
             "decisions_overdue": [],
             "contracts_average_lifecycle_seconds": [],
+        }
+        module_series: dict[str, dict[str, list[dict[str, Any]]]] = {
+            module_name: {
+                "agents_queue_length": [],
+                "agents_failure_rate": [],
+                "agents_dispatch_latency_seconds": [],
+            }
+            for module_name in sorted(module_buckets.keys())
         }
 
         for epoch in ordered_epochs:
@@ -1436,9 +1494,28 @@ class CoreAgentManager:
             series["decisions_overdue"].append({"t": point["bucket_start"], "v": point["decisions"]["overdue_count_avg"]})
             series["contracts_average_lifecycle_seconds"].append({"t": point["bucket_start"], "v": point["contracts"]["average_lifecycle_seconds_avg"]})
 
+            for module_name, per_module in module_buckets.items():
+                module_bucket = per_module.get(epoch)
+                if module_bucket is None:
+                    continue
+                module_series[module_name]["agents_queue_length"].append(
+                    {"t": point["bucket_start"], "v": round(self._average(module_bucket["queue"]), 3)}
+                )
+                module_series[module_name]["agents_failure_rate"].append(
+                    {"t": point["bucket_start"], "v": round(self._average(module_bucket["failure_rate"]), 6)}
+                )
+                module_series[module_name]["agents_dispatch_latency_seconds"].append(
+                    {"t": point["bucket_start"], "v": round(self._average(module_bucket["dispatch_latency"]), 3)}
+                )
+
         return {
             "generated_at": self._now_iso(),
             "snapshot_type": snapshot_type,
+            "modules": {
+                "requested": normalized_modules,
+                "available": sorted(available_modules),
+                "included": sorted(module_buckets.keys()),
+            },
             "window": {
                 "hours": safe_hours,
                 "bucket_minutes": safe_bucket_minutes,
@@ -1448,6 +1525,7 @@ class CoreAgentManager:
             "point_count": len(points),
             "points": points,
             "series": series,
+            "module_series": module_series,
         }
 
     def _maybe_capture_metrics_snapshot(self, force: bool = False) -> dict[str, Any] | None:
