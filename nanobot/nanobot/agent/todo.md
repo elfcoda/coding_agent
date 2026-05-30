@@ -98,8 +98,23 @@ Module
 验证器
 你的方案成立的前提，是 agent 先按接口继续写代码，后续真实实现补上还能自动发现偏差。所以每个模块必须有最小验证动作，比如类型检查、接口测试、编译检查。否则只是把串行错误并行化。
 
+todo：要检查写入的时候代码和之前是否有变化（不重要）
 
 
 
 
+
+1. request合约未实现不会影响当前 work item 继续执行，但是会block verify阶段（如果有的话）
+2. request B -> C后request C可能重复请求合约，看core agent能不能去重
+* 3. work item可能是普通的也可能是实现合约的，如果是实现合约的实现完把dependency_edge状态改掉就能通知另一个work item已经实现了， 为什么还需要module级别的contract管理合约状态。是因为contract的实现是module的静态接口吗，有了这个接口后面可能查询不同的work item的接口依赖是否都实现了。那么既然是静态的接口，为什么需要两个module的字段呢，contract仅当前module的字段不行吗，这样contract的接口owner是当前module，可以给任何其他work item查询实现状态也可以被任何其他module使用
+
+因为是静态的，实现完就永远属于当前模块，可以被查询，所以专门搞了这样的record
+那为什么不设置单独的接口和名字还有状态呢，因为需要知道依赖模块
+然后问问ai，接口被修改是不是要自动触发contract record的变化
+如果a和b都依赖c的同一接口，两个contract需要merge吗
+
+todo：当新的work item依赖module里的proposed 接口或者完成的接口，只有未完成需要运行时依赖添加，后面完成了会通知。
+是不是还需要每个模块的readme，以及每个模块的单独可以提供的接口总和汇总
+
+所以变成了面向接口的agent编程，以及decision first
 
