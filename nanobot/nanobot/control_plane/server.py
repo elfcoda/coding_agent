@@ -71,7 +71,6 @@ class CreateWorkItemCommandRequest(BaseModel):
     session_key: str = ""
     decision_required: bool = False
     decision_type: str = ""
-    depends_on: list[str] = Field(default_factory=list)
     blocked_by: list[str] = Field(default_factory=list)
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)

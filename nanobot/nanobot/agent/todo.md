@@ -99,22 +99,57 @@ Module
 你的方案成立的前提，是 agent 先按接口继续写代码，后续真实实现补上还能自动发现偏差。所以每个模块必须有最小验证动作，比如类型检查、接口测试、编译检查。否则只是把串行错误并行化。
 
 todo：要检查写入的时候代码和之前是否有变化（不重要）
+做个熵score，超过score的就请求用户msg
+接口被重构要自动触发contract record依赖的模块的task的检查（todo暂时不做）
+所以变成了面向接口的agent编程，以及decision first
+如果a和b都依赖c的同一接口，两个contract都需要在record上保留静态记录，同时也有task依赖
+是不是还需要每个模块的readme，以及每个模块的单独可以提供的接口总和汇总（todo：也就是要给查询）
+block状态代表链路完整的状态，非block后可以完整verify路径。而默认情况下是非阻塞的agent执行的，所以不需要多余的额外状态
 
 
+4. 改为：ontract invalidation / revalidation是产物管理方面的， 需要通过contractRecord的模块字段传播，当ontract invalidation / revalidation后，需要找到字段里的 模块依赖，也就是哪些模块依赖了这个contract，那么这个contact的变化就会对他有影响，所以需要去做检查，检查version等其他条件是否需要变更，如果要变更，就需要对那个模块新建work item去处理那个模块重构contract的事情。contract第一次完成 resolved version就是1，这时候验证另一个或者多个依赖模块的时候发现依赖是没问题的，所以不需要派发work  item
 
 
-
+==============================================================================================
 1. request合约未实现不会影响当前 work item 继续执行，但是会block verify阶段（如果有的话）
 2. request B -> C后request C可能重复请求合约，看core agent能不能去重
-* 3. work item可能是普通的也可能是实现合约的，如果是实现合约的实现完把dependency_edge状态改掉就能通知另一个work item已经实现了， 为什么还需要module级别的contract管理合约状态。是因为contract的实现是module的静态接口吗，有了这个接口后面可能查询不同的work item的接口依赖是否都实现了。那么既然是静态的接口，为什么需要两个module的字段呢，contract仅当前module的字段不行吗，这样contract的接口owner是当前module，可以给任何其他work item查询实现状态也可以被任何其他module使用
 
-因为是静态的，实现完就永远属于当前模块，可以被查询，所以专门搞了这样的record
-那为什么不设置单独的接口和名字还有状态呢，因为需要知道依赖模块
-然后问问ai，接口被修改是不是要自动触发contract record的变化
-如果a和b都依赖c的同一接口，两个contract需要merge吗
+
+
+
+对work item加个字段：impl_on_contracts代表work item在实现的多个contract，
+然后core manager对work item的block状态做以下判定：
+1. 依赖的DependencyEdgeRecord都已经inactive
+2. impl_on_contracts里是的contract都已经完结
+3. 当前work item的执行进程已结束
+当以上3个条件都满足，当前work item就取消block阻塞状态。
+判定时机包含以下：
+1. 当一个work item进程结束返回给core manager后
+2. 当scheduler循环扫描发现有contract的状态发生变化为完结
+3. 当某个work item被取消block状态导致依赖边变成inactive后
+
+
 
 todo：当新的work item依赖module里的proposed 接口或者完成的接口，只有未完成需要运行时依赖添加，后面完成了会通知。
-是不是还需要每个模块的readme，以及每个模块的单独可以提供的接口总和汇总
 
-所以变成了面向接口的agent编程，以及decision first
+
+
+
+
+contract:
+provider_module
+version
+interface_name
+functions
+{
+    name
+    sig
+    desc
+    impl_status
+    impl_latest_work_item_id # 可能有多个迭代历史，使用最新的一个
+    consumer_modules {module_id}[]
+}[]
+
+
+
 

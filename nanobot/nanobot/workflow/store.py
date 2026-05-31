@@ -40,7 +40,6 @@ class WorkItemRecord:
     session_key: str = ""
     decision_required: bool = False
     decision_type: str = ""
-    depends_on: list[str] = field(default_factory=list)
     blocked_by: list[str] = field(default_factory=list)
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -138,7 +137,6 @@ class WorkflowStore:
                     session_key TEXT NOT NULL DEFAULT '',
                     decision_required INTEGER NOT NULL DEFAULT 0,
                     decision_type TEXT NOT NULL DEFAULT '',
-                    depends_on_json TEXT NOT NULL DEFAULT '[]',
                     blocked_by_json TEXT NOT NULL DEFAULT '[]',
                     artifacts_json TEXT NOT NULL DEFAULT '[]',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -232,9 +230,9 @@ class WorkflowStore:
                 """
                 INSERT INTO work_items (
                     id, module, goal, status, priority, owner_agent, session_key,
-                    decision_required, decision_type, depends_on_json, blocked_by_json,
+                    decision_required, decision_type, blocked_by_json,
                     artifacts_json, metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.id,
@@ -246,7 +244,6 @@ class WorkflowStore:
                     record.session_key,
                     int(record.decision_required),
                     record.decision_type,
-                    _encode_json(record.depends_on),
                     _encode_json(record.blocked_by),
                     _encode_json(record.artifacts),
                     _encode_json(record.metadata),
@@ -271,7 +268,6 @@ class WorkflowStore:
             session_key=changes.get("session_key", current.session_key),
             decision_required=changes.get("decision_required", current.decision_required),
             decision_type=changes.get("decision_type", current.decision_type),
-            depends_on=list(changes.get("depends_on", current.depends_on)),
             blocked_by=list(changes.get("blocked_by", current.blocked_by)),
             artifacts=list(changes.get("artifacts", current.artifacts)),
             metadata=dict(changes.get("metadata", current.metadata)),
@@ -285,7 +281,7 @@ class WorkflowStore:
                 UPDATE work_items
                 SET module = ?, goal = ?, status = ?, priority = ?, owner_agent = ?,
                     session_key = ?, decision_required = ?, decision_type = ?,
-                    depends_on_json = ?, blocked_by_json = ?, artifacts_json = ?,
+                    blocked_by_json = ?, artifacts_json = ?,
                     metadata_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -298,7 +294,6 @@ class WorkflowStore:
                     updated.session_key,
                     int(updated.decision_required),
                     updated.decision_type,
-                    _encode_json(updated.depends_on),
                     _encode_json(updated.blocked_by),
                     _encode_json(updated.artifacts),
                     _encode_json(updated.metadata),
@@ -757,7 +752,6 @@ class WorkflowStore:
             session_key=row["session_key"],
             decision_required=bool(row["decision_required"]),
             decision_type=row["decision_type"],
-            depends_on=_decode_json(row["depends_on_json"], []),
             blocked_by=_decode_json(row["blocked_by_json"], []),
             artifacts=_decode_json(row["artifacts_json"], []),
             metadata=_decode_json(row["metadata_json"], {}),

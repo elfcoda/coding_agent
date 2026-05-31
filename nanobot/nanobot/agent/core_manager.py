@@ -276,7 +276,7 @@ class CoreAgentManager:
                 "status": "requested",
                 "spec": spec,
                 "stub_path": f"{consumer_normalized}/{relative_path}" if not relative_path.startswith(consumer_normalized + "/") else relative_path,
-                "work_item_id": consumer_linked_work_item,
+                "work_item_id": provider_linked_work_item,
                 "consumer_work_item_id": consumer_linked_work_item,
                 "provider_work_item_id": provider_linked_work_item,
                 "metadata": {
@@ -545,21 +545,22 @@ class CoreAgentManager:
         metadata = dict(existing.metadata)
 
         incoming_work_item_id = str(fields.get("work_item_id") or "").strip()
+        incoming_implementer_work_item_id = str(fields.get("provider_work_item_id") or incoming_work_item_id).strip()
         incoming_consumer_work_item_id = str(fields.get("consumer_work_item_id") or "").strip()
         incoming_provider_work_item_id = str(fields.get("provider_work_item_id") or "").strip()
 
         merged_work_item_ids = self._unique_list(
             [str(item).strip() for item in metadata.get("merged_work_item_ids", []) if str(item).strip()]
             + ([existing.work_item_id] if str(existing.work_item_id).strip() else [])
-            + ([incoming_work_item_id] if incoming_work_item_id else [])
+            + ([incoming_implementer_work_item_id] if incoming_implementer_work_item_id else [])
         )
         merged_consumer_work_item_ids = self._unique_list(
             [str(item).strip() for item in metadata.get("merged_consumer_work_item_ids", []) if str(item).strip()]
-            + ([existing.work_item_id] if str(existing.work_item_id).strip() else [])
             + ([incoming_consumer_work_item_id] if incoming_consumer_work_item_id else [])
         )
         merged_provider_work_item_ids = self._unique_list(
             [str(item).strip() for item in metadata.get("merged_provider_work_item_ids", []) if str(item).strip()]
+            + ([existing.work_item_id] if str(existing.work_item_id).strip() else [])
             + ([incoming_provider_work_item_id] if incoming_provider_work_item_id else [])
         )
 
@@ -585,7 +586,7 @@ class CoreAgentManager:
                 "interface_name": str(fields.get("interface_name") or existing.interface_name),
                 "version": int(fields.get("version", existing.version)),
                 "status": str(fields.get("status", "requested")),
-                "work_item_id": incoming_work_item_id,
+                "work_item_id": incoming_implementer_work_item_id,
                 "consumer_work_item_id": incoming_consumer_work_item_id,
                 "provider_work_item_id": incoming_provider_work_item_id,
                 "source": incoming_request_source,
@@ -626,8 +627,8 @@ class CoreAgentManager:
         incoming_implementation_path = str(fields.get("implementation_path") or "")
         if not existing.implementation_path and incoming_implementation_path:
             changes["implementation_path"] = incoming_implementation_path
-        if not str(existing.work_item_id).strip() and incoming_work_item_id:
-            changes["work_item_id"] = incoming_work_item_id
+        if not str(existing.work_item_id).strip() and incoming_implementer_work_item_id:
+            changes["work_item_id"] = incoming_implementer_work_item_id
 
         updated = self.workflow_store.update_contract(existing.id, **changes)
         self._emit_workflow_event("workflow.contract.updated", self._serialize_workflow_record(updated))
@@ -658,23 +659,140 @@ class CoreAgentManager:
                 return item
         return items[0] if items else None
 
-    def _sync_contract_blocking(self, contract: ContractRecord) -> None:
-        """Apply contract status to any linked work items that reference it as blocker."""
-        resolved = contract.status in {"accepted", "implemented", "completed"}
-        work_items = self.list_work_items(limit=500)
-        for work_item in work_items:
-            if contract.id not in work_item.blocked_by:
+    @staticmethod
+    def _is_work_item_terminal(status: str) -> bool:
+        return status in {"completed", "done", "cancelled"}
+
+    def _resolve_contract_consumer_work_item_id(self, contract: ContractRecord, fields: dict[str, Any]) -> str:
+        consumer_work_item_id = str(fields.get("consumer_work_item_id") or "").strip()
+        if consumer_work_item_id:
+            return consumer_work_item_id
+
+        merged = [
+            str(item).strip()
+            for item in dict(contract.metadata or {}).get("merged_consumer_work_item_ids", [])
+            if str(item).strip()
+        ]
+        if merged:
+            return merged[-1]
+
+        candidate = self._find_latest_work_item_for_module(contract.consumer_module)
+        return candidate.id if candidate else ""
+
+    def _edge_blocks_work_item(self, edge: DependencyEdgeRecord) -> bool:
+        if edge.status != "active":
+            return False
+        target = self.get_work_item(edge.target_work_item_id)
+        return bool(target and not self._is_work_item_terminal(target.status))
+
+    def _sync_work_item_dependency_blockers(self, work_item_id: str) -> WorkItemRecord | None:
+        work_item = self.get_work_item(work_item_id)
+        if work_item is None:
+            return None
+
+        edges = self.list_dependency_edges(filters={"source_work_item_id": work_item_id}, limit=500)
+        edge_ids = {edge.id for edge in edges}
+        blocking_edge_ids = [edge.id for edge in edges if self._edge_blocks_work_item(edge)]
+        manual_blockers = [entry for entry in work_item.blocked_by if entry not in edge_ids]
+        desired_blocked_by = self._unique_list(manual_blockers + blocking_edge_ids)
+
+        if desired_blocked_by == list(work_item.blocked_by):
+            return work_item
+
+        return self.update_work_item(work_item.id, {"blocked_by": desired_blocked_by})
+
+    def _sync_contract_implementation_work_item(self, contract: ContractRecord) -> WorkItemRecord | None:
+        implementer_work_item_id = str(contract.work_item_id or "").strip()
+        if not implementer_work_item_id:
+            return None
+
+        work_item = self.get_work_item(implementer_work_item_id)
+        if work_item is None:
+            return None
+
+        desired_status = work_item.status
+        if self._is_contract_resolved(contract.status):
+            if not self._is_work_item_terminal(work_item.status):
+                desired_status = "completed"
+        elif self._is_contract_invalidation_status(contract.status):
+            if work_item.status not in {"in_progress", "blocked", "waiting_decision"}:
+                desired_status = "in_progress"
+
+        if desired_status == work_item.status:
+            return work_item
+
+        return self.update_work_item(work_item.id, {"status": desired_status})
+
+    def _mark_contract_edges_validated(self, contract: ContractRecord) -> None:
+        for edge in self._linked_contract_edges(contract.id):
+            metadata = dict(edge.metadata)
+            next_metadata = {
+                **metadata,
+                "contract_id": contract.id,
+                "revalidation_required": False,
+                "validated_contract_version": contract.version,
+            }
+            if next_metadata != metadata:
+                self.update_dependency_edge(edge.id, {"metadata": next_metadata})
+
+    def _module_requires_contract_followup(self, contract: ContractRecord, edges: list[DependencyEdgeRecord]) -> bool:
+        for edge in edges:
+            metadata = dict(edge.metadata)
+            required_raw = metadata.get("required_contract_version")
+            required_version = int(required_raw) if str(required_raw or "").strip() else 0
+            validated_raw = metadata.get("validated_contract_version")
+            validated_version = int(validated_raw) if str(validated_raw or "").strip() else 0
+            if required_version > 0 and contract.version < required_version:
+                return True
+            if validated_version > 0 and validated_version < contract.version:
+                return True
+        return False
+
+    def _ensure_contract_module_followup(
+        self,
+        contract: ContractRecord,
+        module: str,
+        reason: str,
+        dependent_work_item_ids: list[str],
+    ) -> WorkItemRecord:
+        open_items = self.list_work_items(filters={"module": module}, limit=200)
+        for item in open_items:
+            if item.status in {"completed", "done", "cancelled"}:
                 continue
+            metadata = dict(item.metadata or {})
+            if metadata.get("flow") != "contract_module_revalidation":
+                continue
+            if str(metadata.get("contract_id") or "") != contract.id:
+                continue
+            return item
 
-            next_blocked = [entry for entry in work_item.blocked_by if entry != contract.id] if resolved else list(work_item.blocked_by)
-            updates: dict[str, Any] = {"blocked_by": next_blocked}
-            if resolved and work_item.status == "blocked" and not next_blocked:
-                updates["status"] = "ready"
-            if not resolved and work_item.status not in {"waiting_decision", "blocked"}:
-                updates["status"] = "blocked"
+        return self.create_work_item(
+            {
+                "module": module,
+                "goal": f"Revalidate module {module} for contract {contract.interface_name}",
+                "status": "proposed",
+                "owner_agent": f"{module}-agent",
+                "metadata": {
+                    "flow": "contract_module_revalidation",
+                    "contract_id": contract.id,
+                    "contract_version": contract.version,
+                    "provider_module": contract.provider_module,
+                    "consumer_module": contract.consumer_module,
+                    "interface_name": contract.interface_name,
+                    "reason": reason,
+                    "dependent_work_item_ids": dependent_work_item_ids,
+                },
+            }
+        )
 
-            updated = self.update_work_item(work_item.id, updates)
-            self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(updated))
+    def _sync_contract_blocking(self, contract: ContractRecord) -> None:
+        """Apply contract lifecycle to the implementing work item and linked dependency blockers."""
+        updated_work_item = self._sync_contract_implementation_work_item(contract)
+        if updated_work_item is not None:
+            self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(updated_work_item))
+
+        for edge in self._linked_contract_edges(contract.id):
+            self._sync_work_item_dependency_blockers(edge.source_work_item_id)
 
     @staticmethod
     def _is_contract_resolved(status: str) -> bool:
@@ -705,6 +823,7 @@ class CoreAgentManager:
         if not resolved:
             errors.append(f"contract status is not resolved: {contract.status}")
 
+        # todo: remove this check
         edges = self._linked_contract_edges(contract.id)
         for edge in edges:
             required_version_raw = edge.metadata.get("required_contract_version")
@@ -746,11 +865,9 @@ class CoreAgentManager:
         }
 
     def _propagate_contract_invalidation(self, contract: ContractRecord, reason: str) -> None:
-        """Mark linked edges/work items as requiring revalidation when a contract version becomes stale."""
+        """Mark linked edges for revalidation and create module follow-up work items when compatibility changed."""
         edges = self._linked_contract_edges(contract.id)
-        direct_affected_ids: set[str] = set()
-        depths: dict[str, int] = {}
-        paths: dict[str, list[str]] = {}
+        affected_modules: dict[str, list[DependencyEdgeRecord]] = {}
 
         for edge in edges:
             next_metadata = {
@@ -760,91 +877,28 @@ class CoreAgentManager:
                 "revalidation_reason": reason,
                 "required_contract_version": contract.version,
             }
-            updated_edge = self.update_dependency_edge(
-                edge.id,
-                {
-                    "metadata": next_metadata,
-                    "status": "active",
-                },
-            )
-            source_id = updated_edge.source_work_item_id
-            direct_affected_ids.add(source_id)
-            depths[source_id] = 1
-            paths[source_id] = [source_id]
-
-        work_items = self.list_work_items(limit=500)
-        for work_item in work_items:
-            if contract.id not in work_item.blocked_by:
+            updated_edge = self.update_dependency_edge(edge.id, {"metadata": next_metadata, "status": "active"})
+            source_item = self.get_work_item(updated_edge.source_work_item_id)
+            if source_item is None:
                 continue
-            direct_affected_ids.add(work_item.id)
-            depths.setdefault(work_item.id, 1)
-            paths.setdefault(work_item.id, [work_item.id])
+            affected_modules.setdefault(source_item.module, []).append(updated_edge)
+            self._sync_work_item_dependency_blockers(source_item.id)
 
-        # 处理链式多跳的完整的依赖关系传播
-        if self._revalidation_chain_enabled and direct_affected_ids:
-            active_edges = self.list_dependency_edges(filters={"status": "active"}, limit=5000)
-            incoming: dict[str, list[tuple[str, str]]] = {}
-            for edge in active_edges:
-                if edge.edge_type not in self._revalidation_chain_edge_types:
-                    continue
-                incoming.setdefault(edge.target_work_item_id, []).append((edge.source_work_item_id, edge.id))
+        implementation_item = self._sync_contract_implementation_work_item(contract)
+        if implementation_item is not None:
+            self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(implementation_item))
 
-            queue: deque[tuple[str, int, list[str]]] = deque(
-                (work_item_id, depths.get(work_item_id, 1), paths.get(work_item_id, [work_item_id]))
-                for work_item_id in direct_affected_ids
-            )
-
-            while queue:
-                current_id, current_depth, current_path = queue.popleft()
-                if current_depth >= self._revalidation_chain_max_depth:
-                    continue
-
-                for source_id, _ in incoming.get(current_id, []):
-                    next_depth = current_depth + 1
-                    previous_depth = depths.get(source_id)
-                    if previous_depth is not None and previous_depth <= next_depth:
-                        continue
-                    next_path = [*current_path, source_id]
-                    depths[source_id] = next_depth
-                    paths[source_id] = next_path
-                    queue.append((source_id, next_depth, next_path))
-
-        affected_work_item_ids = set(depths)
-
-        for work_item_id in affected_work_item_ids:
-            work_item = self.get_work_item(work_item_id)
-            if work_item is None:
+        followups: list[dict[str, Any]] = []
+        for module, module_edges in affected_modules.items():
+            if not self._module_requires_contract_followup(contract, module_edges):
                 continue
-
-            revalidation_meta = {
-                "required": True,
-                "contract_id": contract.id,
-                "required_version": contract.version,
-                "reason": reason,
-                "depth": depths.get(work_item_id, 1),
-                "path": paths.get(work_item_id, [work_item_id]),
-            }
-            metadata = {**work_item.metadata, "revalidation": revalidation_meta}
-            next_blocked_by = self._unique_list(list(work_item.blocked_by) + [contract.id])
-            updates: dict[str, Any] = {
-                "metadata": metadata,
-                "blocked_by": next_blocked_by,
-            }
-            if work_item.status not in {"blocked", "waiting_decision"}:
-                updates["status"] = "blocked"
-
-            updated = self.update_work_item(work_item.id, updates)
-            self._emit_workflow_event("workflow.work_item.revalidation.required", self._serialize_workflow_record(updated))
-            self._emit_workflow_event(
-                "workflow.work_item.revalidation.propagated",
-                {
-                    "work_item_id": updated.id,
-                    "contract_id": contract.id,
-                    "reason": reason,
-                    "depth": depths.get(work_item_id, 1),
-                    "path": paths.get(work_item_id, [work_item_id]),
-                },
+            followup = self._ensure_contract_module_followup(
+                contract,
+                module,
+                reason,
+                [edge.source_work_item_id for edge in module_edges],
             )
+            followups.append({"module": module, "work_item_id": followup.id})
 
         self._emit_workflow_event(
             "workflow.contract.version.invalidated",
@@ -853,65 +907,15 @@ class CoreAgentManager:
                 "version": contract.version,
                 "reason": reason,
                 "affected_edge_count": len(edges),
-                "direct_affected_work_item_count": len(direct_affected_ids),
-                "affected_work_item_count": len(affected_work_item_ids),
-                "chain_mode": "dag" if self._revalidation_chain_enabled else "one_hop",
-                "chain_edge_types": sorted(self._revalidation_chain_edge_types),
-                "max_depth": self._revalidation_chain_max_depth,
-                "affected": [
-                    {
-                        "work_item_id": work_item_id,
-                        "depth": depths.get(work_item_id, 1),
-                        "path": paths.get(work_item_id, [work_item_id]),
-                    }
-                    for work_item_id in sorted(affected_work_item_ids)
-                ],
+                "affected_modules": sorted(affected_modules),
+                "followups": followups,
             },
         )
 
     def _clear_contract_revalidation(self, contract: ContractRecord) -> None:
-        """Clear revalidation markers only after executable checks pass."""
+        """Mark linked edges validated again after executable checks pass."""
         report = self._run_contract_revalidation_checks(contract)
         if not report["passed"]:
-            # 还有两个现实场景需要这个兜底
-            # 1. 人工或其他流程把状态改成了 ready/in_progress，失败分支要强制回收。
-            # 2. 历史数据漂移（metadata 有 revalidation 标记，但 blocker/status 不一致），失败分支要修复一致性。
-            affected_work_item_ids: set[str] = set()
-            edges = self._linked_contract_edges(contract.id)
-            for edge in edges:
-                affected_work_item_ids.add(edge.source_work_item_id)
-
-            work_items = self.list_work_items(limit=500)
-            for work_item in work_items:
-                marker = dict(work_item.metadata.get("revalidation", {}))
-                if str(marker.get("contract_id") or "") == contract.id:
-                    affected_work_item_ids.add(work_item.id)
-
-            for work_item_id in affected_work_item_ids:
-                work_item = self.get_work_item(work_item_id)
-                if work_item is None:
-                    continue
-
-                marker = dict(work_item.metadata.get("revalidation", {}))
-                marker.update(
-                    {
-                        "required": True,
-                        "contract_id": contract.id,
-                        "required_version": marker.get("required_version") or contract.version,
-                        "last_failed_checks": report["errors"],
-                    }
-                )
-                next_blocked_by = self._unique_list(list(work_item.blocked_by) + [contract.id])
-                updates: dict[str, Any] = {
-                    "metadata": {**work_item.metadata, "revalidation": marker},
-                    "blocked_by": next_blocked_by,
-                }
-                if work_item.status not in {"blocked", "waiting_decision"}:
-                    updates["status"] = "blocked"
-
-                updated = self.update_work_item(work_item.id, updates)
-                self._emit_workflow_event("workflow.work_item.revalidation.failed", self._serialize_workflow_record(updated))
-
             self._emit_workflow_event(
                 "workflow.contract.revalidation.failed",
                 {
@@ -925,49 +929,13 @@ class CoreAgentManager:
             )
             return
 
-        edges = self._linked_contract_edges(contract.id)
-        for edge in edges:
-            metadata = dict(edge.metadata)
-            if not metadata.get("revalidation_required"):
-                continue
-            metadata["revalidation_required"] = False
-            metadata["validated_contract_version"] = contract.version
-            self.update_dependency_edge(edge.id, {"metadata": metadata})
+        self._mark_contract_edges_validated(contract)
+        implementation_item = self._sync_contract_implementation_work_item(contract)
+        if implementation_item is not None:
+            self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(implementation_item))
 
-        work_items = self.list_work_items(limit=500)
-        for work_item in work_items:
-            marker = dict(work_item.metadata.get("revalidation", {}))
-            if str(marker.get("contract_id") or "") != contract.id:
-                continue
-            required_version_raw = marker.get("required_version")
-            required_version = int(required_version_raw) if str(required_version_raw or "").strip() else 0
-            if required_version > 0 and contract.version < required_version:
-                self._emit_workflow_event(
-                    "workflow.work_item.revalidation.failed",
-                    {
-                        "work_item_id": work_item.id,
-                        "contract_id": contract.id,
-                        "required_version": required_version,
-                        "contract_version": contract.version,
-                        "reason": "contract_version_too_low",
-                    },
-                )
-                continue
-            marker["required"] = False
-            marker["validated_version"] = contract.version
-            next_blocked_by = [entry for entry in work_item.blocked_by if entry != contract.id]
-            updates: dict[str, Any] = {
-                "metadata": {**work_item.metadata, "revalidation": marker},
-                "blocked_by": next_blocked_by,
-            }
-            if work_item.status == "blocked" and not next_blocked_by:
-                updates["status"] = "ready"
-                scheduler_meta = dict(work_item.metadata.get("scheduler", {}))
-                scheduler_meta.setdefault("ready_since", self._now_iso())
-                updates["metadata"] = {**work_item.metadata, "revalidation": marker, "scheduler": scheduler_meta}
-
-            updated = self.update_work_item(work_item.id, updates)
-            self._emit_workflow_event("workflow.work_item.revalidation.cleared", self._serialize_workflow_record(updated))
+        for edge in self._linked_contract_edges(contract.id):
+            self._sync_work_item_dependency_blockers(edge.source_work_item_id)
 
         self._emit_workflow_event(
             "workflow.contract.revalidation.passed",
@@ -1005,28 +973,12 @@ class CoreAgentManager:
             self._clear_contract_revalidation(updated)
 
     def _apply_contract_side_effects(self, contract: ContractRecord, fields: dict[str, Any]) -> None:
-        """Auto-link contract lifecycle with dependency edges and work item blockers."""
+        """Auto-link contract lifecycle with dependency edges and implementing work items."""
         auto_edge = bool(fields.get("auto_create_dependency_edge", True))
-        consumer_work_item_id = str(fields.get("consumer_work_item_id") or contract.work_item_id or "")
-        if not consumer_work_item_id:
-            candidate = self._find_latest_work_item_for_module(contract.consumer_module)
-            consumer_work_item_id = candidate.id if candidate else ""
-
-        # Always attach contract blocker to consumer work item for scheduler visibility.
-        if consumer_work_item_id:
-            consumer_item = self.get_work_item(consumer_work_item_id)
-            if consumer_item:
-                next_blocked_by = self._unique_list(list(consumer_item.blocked_by) + [contract.id])
-                updates: dict[str, Any] = {
-                    "blocked_by": next_blocked_by,
-                }
-                if contract.status not in {"accepted", "implemented", "completed"} and consumer_item.status not in {"blocked", "waiting_decision"}:
-                    updates["status"] = "blocked"
-                updated = self.update_work_item(consumer_work_item_id, updates)
-                self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(updated))
+        consumer_work_item_id = self._resolve_contract_consumer_work_item_id(contract, fields)
 
         if auto_edge:
-            provider_work_item_id = str(fields.get("provider_work_item_id") or "")
+            provider_work_item_id = str(fields.get("provider_work_item_id") or contract.work_item_id or "")
 
             if not provider_work_item_id:
                 candidate = self._find_latest_work_item_for_module(contract.provider_module)
@@ -1059,8 +1011,10 @@ class CoreAgentManager:
                             "metadata": {"contract_id": contract.id},
                         }
                     )
-                # 已经移除业务路径里的 depends_on 双写，单一来源于 dependency_edges
                 self._emit_workflow_event("workflow.dependency_edge.upserted", self._serialize_workflow_record(edge))
+
+                if self._is_contract_resolved(contract.status):
+                    self._mark_contract_edges_validated(contract)
 
         self._sync_contract_blocking(contract)
 
@@ -1117,33 +1071,14 @@ class CoreAgentManager:
             if sla_overdue:
                 blockers.append("pending_decision_sla")
 
-            edges = self.list_dependency_edges(filters={"source_work_item_id": work_item.id, "status": "active"}, limit=100)
-            for edge in edges:
-                target = self.get_work_item(edge.target_work_item_id)
-                if target and target.status not in {"completed", "done", "cancelled"}:
-                    blockers.append(f"dependency:{edge.id}")
+            edges = self.list_dependency_edges(filters={"source_work_item_id": work_item.id}, limit=100)
+            blocking_edge_ids = [edge.id for edge in edges if self._edge_blocks_work_item(edge)]
+            blockers.extend([f"dependency:{edge_id}" for edge_id in blocking_edge_ids])
 
-            # Single source of truth: dependency_edges. WorkItem.depends_on is a scheduler-maintained projection.
-            # 不一致才回写，避免无意义抖动写库
-            # 依赖只写 edge，depends_on 由 scheduler 自动投影修复。
-            desired_depends_on = sorted({edge.target_work_item_id for edge in edges})
-            current_depends_on = sorted({str(item) for item in work_item.depends_on})
-            if desired_depends_on != current_depends_on:
-                projected = self.update_work_item(
-                    work_item.id,
-                    {
-                        "depends_on": desired_depends_on,
-                    },
-                )
-                work_item = projected
-                self._emit_workflow_event("workflow.work_item.dependencies_projected", self._serialize_workflow_record(projected))
-
-            unresolved_contracts = []
-            for contract_id in work_item.blocked_by:
-                contract = self.get_contract(contract_id)
-                if contract and contract.status not in {"accepted", "implemented", "completed"}:
-                    unresolved_contracts.append(contract_id)
-            blockers.extend([f"contract:{item}" for item in unresolved_contracts])
+            edge_ids = {edge.id for edge in edges}
+            manual_blockers = [entry for entry in work_item.blocked_by if entry not in edge_ids]
+            desired_blocked_by = self._unique_list(manual_blockers + blocking_edge_ids)
+            blockers.extend([f"manual:{entry}" for entry in manual_blockers])
 
             desired_status = work_item.status
             desired_decision_required = bool(pending_decisions)
@@ -1161,7 +1096,11 @@ class CoreAgentManager:
             elif work_item.status in {"proposed", "blocked", "waiting_decision"}:
                 desired_status = "ready"
 
-            if desired_status != work_item.status or desired_decision_required != work_item.decision_required:
+            if (
+                desired_status != work_item.status
+                or desired_decision_required != work_item.decision_required
+                or desired_blocked_by != work_item.blocked_by
+            ):
                 scheduler_updates: dict[str, Any] = {"state": "reconciled"}
                 if desired_status == "ready":
                     scheduler_updates["ready_since"] = work_item.metadata.get("scheduler", {}).get("ready_since", self._now_iso())
@@ -1173,6 +1112,7 @@ class CoreAgentManager:
                     {
                         "status": desired_status,
                         "decision_required": desired_decision_required,
+                        "blocked_by": desired_blocked_by,
                         "metadata": self._next_work_item_metadata(work_item, **scheduler_updates),
                     },
                 )
@@ -1810,7 +1750,6 @@ class CoreAgentManager:
             session_key=str(fields.get("session_key", "")),
             decision_required=bool(fields.get("decision_required", False)),
             decision_type=str(fields.get("decision_type", "")),
-            depends_on=list(fields.get("depends_on", [])),
             blocked_by=list(fields.get("blocked_by", [])),
             artifacts=list(fields.get("artifacts", [])),
             metadata=metadata,
@@ -1856,14 +1795,15 @@ class CoreAgentManager:
             return self._merge_contract_request(existing, fields)
 
         work_item_id = str(fields.get("work_item_id", "")).strip()
-        consumer_work_item_id = str(fields.get("consumer_work_item_id", "")).strip() or work_item_id
         provider_work_item_id = str(fields.get("provider_work_item_id", "")).strip()
+        implementer_work_item_id = provider_work_item_id or work_item_id
+        consumer_work_item_id = str(fields.get("consumer_work_item_id", "")).strip()
         incoming_metadata = dict(fields.get("metadata", {}))
         incoming_metadata.setdefault("merged_request_count", 1)
         incoming_metadata.setdefault("dedupe_mode", "request_merge")
-        incoming_metadata.setdefault("merged_work_item_ids", [item for item in [work_item_id] if item])
+        incoming_metadata.setdefault("merged_work_item_ids", [item for item in [implementer_work_item_id] if item])
         incoming_metadata.setdefault("merged_consumer_work_item_ids", [item for item in [consumer_work_item_id] if item])
-        incoming_metadata.setdefault("merged_provider_work_item_ids", [item for item in [provider_work_item_id] if item])
+        incoming_metadata.setdefault("merged_provider_work_item_ids", [item for item in [implementer_work_item_id] if item])
 
         record = ContractRecord(
             id=str(fields.get("id") or uuid.uuid4())[:36],
@@ -1875,7 +1815,7 @@ class CoreAgentManager:
             spec=dict(fields.get("spec", {})),
             stub_path=str(fields.get("stub_path", "")),
             implementation_path=str(fields.get("implementation_path", "")),
-            work_item_id=work_item_id,
+            work_item_id=implementer_work_item_id,
             metadata=incoming_metadata,
         )
         created = self.workflow_store.create_contract(record)
@@ -1973,6 +1913,7 @@ class CoreAgentManager:
             metadata=dict(fields.get("metadata", {})),
         )
         created = self.workflow_store.create_dependency_edge(record)
+        self._sync_work_item_dependency_blockers(created.source_work_item_id)
         self._emit_workflow_event("workflow.dependency_edge.created", self._serialize_workflow_record(created))
         return created
 
@@ -1990,12 +1931,18 @@ class CoreAgentManager:
         )
 
     def update_dependency_edge(self, record_id: str, changes: dict[str, Any]) -> DependencyEdgeRecord:
+        previous = self.get_dependency_edge(record_id)
         updated = self.workflow_store.update_dependency_edge(record_id, **changes)
+        for work_item_id in {item for item in [updated.source_work_item_id, previous.source_work_item_id if previous else ""] if item}:
+            self._sync_work_item_dependency_blockers(work_item_id)
         self._emit_workflow_event("workflow.dependency_edge.updated", self._serialize_workflow_record(updated))
         return updated
 
     def delete_dependency_edge(self, record_id: str) -> bool:
+        previous = self.get_dependency_edge(record_id)
         deleted = self.workflow_store.delete_dependency_edge(record_id)
+        if deleted and previous is not None:
+            self._sync_work_item_dependency_blockers(previous.source_work_item_id)
         self._emit_workflow_event("workflow.dependency_edge.deleted", {"id": record_id, "deleted": deleted})
         return deleted
 

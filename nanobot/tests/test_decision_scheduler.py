@@ -148,3 +148,121 @@ def test_degradation_modes_affect_waiting_decision_status(tmp_path: Path) -> Non
     assert wait_after is not None and wait_after.status == "waiting_decision"
     assert stub_after is not None and stub_after.status == "blocked"
     assert partial_after is not None and partial_after.status == "ready"
+
+
+def test_contract_request_tracks_provider_work_item_and_uses_edge_blockers(tmp_path: Path) -> None:
+    (tmp_path / "fastcode").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "nanobot").mkdir(parents=True, exist_ok=True)
+    manager, _ = _make_manager(tmp_path, sla_seconds=3600)
+
+    provider = manager.create_work_item({"module": "fastcode", "goal": "implement shared contract", "status": "in_progress"})
+    consumer = manager.create_work_item({"module": "nanobot", "goal": "wait for shared contract", "status": "proposed"})
+
+    contract = manager.create_contract(
+        {
+            "provider_module": "fastcode",
+            "consumer_module": "nanobot",
+            "interface_name": "SharedSearch",
+            "status": "requested",
+            "consumer_work_item_id": consumer.id,
+            "provider_work_item_id": provider.id,
+        }
+    )
+
+    manager.run_workflow_scheduler_tick(limit=50)
+
+    contract_after = manager.get_contract(contract.id)
+    consumer_after = manager.get_work_item(consumer.id)
+    edges = manager.list_dependency_edges(
+        filters={
+            "source_work_item_id": consumer.id,
+            "target_work_item_id": provider.id,
+            "edge_type": "requires_contract",
+            "status": "active",
+        },
+        limit=10,
+    )
+
+    assert contract_after is not None and contract_after.work_item_id == provider.id
+    assert len(edges) == 1
+    assert consumer_after is not None and consumer_after.status == "blocked"
+    assert consumer_after.blocked_by == [edges[0].id]
+
+
+def test_scheduler_clears_edge_blocker_when_dependency_edge_is_inactive(tmp_path: Path) -> None:
+    (tmp_path / "fastcode").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "nanobot").mkdir(parents=True, exist_ok=True)
+    manager, _ = _make_manager(tmp_path, sla_seconds=3600)
+
+    provider = manager.create_work_item({"module": "fastcode", "goal": "implement shared contract", "status": "in_progress"})
+    consumer = manager.create_work_item({"module": "nanobot", "goal": "wait for shared contract", "status": "proposed"})
+
+    manager.create_contract(
+        {
+            "provider_module": "fastcode",
+            "consumer_module": "nanobot",
+            "interface_name": "SharedSearch",
+            "status": "requested",
+            "consumer_work_item_id": consumer.id,
+            "provider_work_item_id": provider.id,
+        }
+    )
+
+    manager.run_workflow_scheduler_tick(limit=50)
+    edge = manager.list_dependency_edges(
+        filters={
+            "source_work_item_id": consumer.id,
+            "target_work_item_id": provider.id,
+            "edge_type": "requires_contract",
+            "status": "active",
+        },
+        limit=10,
+    )[0]
+
+    manager.update_dependency_edge(edge.id, {"status": "inactive"})
+    manager.run_workflow_scheduler_tick(limit=50)
+
+    consumer_after = manager.get_work_item(consumer.id)
+
+    assert consumer_after is not None and consumer_after.status == "ready"
+    assert consumer_after.blocked_by == []
+
+
+def test_contract_version_change_creates_module_followup_work_item(tmp_path: Path) -> None:
+    (tmp_path / "fastcode").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "nanobot").mkdir(parents=True, exist_ok=True)
+    manager, _ = _make_manager(tmp_path, sla_seconds=3600)
+
+    provider = manager.create_work_item({"module": "fastcode", "goal": "implement shared contract", "status": "in_progress"})
+    consumer = manager.create_work_item({"module": "nanobot", "goal": "integrate shared contract", "status": "ready"})
+
+    contract = manager.create_contract(
+        {
+            "provider_module": "fastcode",
+            "consumer_module": "nanobot",
+            "interface_name": "SharedSearch",
+            "status": "implemented",
+            "version": 1,
+            "consumer_work_item_id": consumer.id,
+            "provider_work_item_id": provider.id,
+        }
+    )
+
+    existing_nanobot_ids = {item.id for item in manager.list_work_items(filters={"module": "nanobot"}, limit=50)}
+
+    manager.update_contract(
+        contract.id,
+        {
+            "version": 2,
+            "status": "invalidated",
+            "invalidate_dependents": True,
+        },
+    )
+
+    nanobot_items = manager.list_work_items(filters={"module": "nanobot"}, limit=50)
+    followups = [item for item in nanobot_items if item.id not in existing_nanobot_ids]
+
+    assert len(followups) == 1
+    assert followups[0].status == "proposed"
+    assert followups[0].metadata.get("contract_id") == contract.id
+    assert followups[0].metadata.get("contract_version") == 2
