@@ -127,13 +127,6 @@ functions
 }[]
 
 
-==============================================================================================
-1. request合约未实现不会影响当前 work item 继续执行，但是会block verify阶段（如果有的话）
-2. request B -> C后request C可能重复请求合约，看core agent能不能去重
-
-
-
-
 对work item加个字段：impl_on_contracts代表work item在实现的多个contract，
 然后core manager对work item的block状态做以下判定：
 1. 依赖的DependencyEdgeRecord都已经inactive
@@ -145,9 +138,18 @@ functions
 2. 当scheduler循环扫描发现有contract的状态发生变化为完结
 3. 当某个work item被取消block状态导致依赖边变成inactive后
 
+当work item需要依赖某个module里的某个接口的未完成的函数，需要对当前work item到未完成函数的impl_latest_work_item_id添加依赖，并把当前work item所属的module添加到consumer_modules里，以便后面变更的时候查询这个接口函数有哪些依赖。
+
+==============================================================================================
+1. request合约未实现不会影响当前 work item 继续执行，但是会block verify阶段（如果有的话）
+2. request B -> C后request C可能重复请求合约，看core agent能不能去重
 
 
-todo：当新的work item依赖module里的proposed 接口或者完成的接口，只有未完 成需要运行时依赖添加，后面完成了会通知。
+
+demo阶段只做简单demo和核心模块，尽量别去整理edge case，只演示核心流程的处理。可以vibe，用test驱动demo的功能。自己整理好状态转移系统的核心就行了
+
+
+
 
 
 

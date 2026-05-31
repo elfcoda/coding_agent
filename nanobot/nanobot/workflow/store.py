@@ -40,6 +40,7 @@ class WorkItemRecord:
     session_key: str = ""
     decision_required: bool = False
     decision_type: str = ""
+    impl_on_contracts: list[str] = field(default_factory=list)
     blocked_by: list[str] = field(default_factory=list)
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -138,6 +139,7 @@ class WorkflowStore:
                     session_key TEXT NOT NULL DEFAULT '',
                     decision_required INTEGER NOT NULL DEFAULT 0,
                     decision_type TEXT NOT NULL DEFAULT '',
+                    impl_on_contracts_json TEXT NOT NULL DEFAULT '[]',
                     blocked_by_json TEXT NOT NULL DEFAULT '[]',
                     artifacts_json TEXT NOT NULL DEFAULT '[]',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -225,11 +227,20 @@ class WorkflowStore:
                 CREATE INDEX IF NOT EXISTS idx_metrics_snapshots_generated_at ON metrics_snapshots(generated_at);
                 """
             )
-            columns = {
+            work_item_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(work_items)").fetchall()
+            }
+            if "impl_on_contracts_json" not in work_item_columns:
+                connection.execute(
+                    "ALTER TABLE work_items ADD COLUMN impl_on_contracts_json TEXT NOT NULL DEFAULT '[]'"
+                )
+
+            contract_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(contracts)").fetchall()
             }
-            if "functions_json" not in columns:
+            if "functions_json" not in contract_columns:
                 connection.execute(
                     "ALTER TABLE contracts ADD COLUMN functions_json TEXT NOT NULL DEFAULT '[]'"
                 )
@@ -240,9 +251,9 @@ class WorkflowStore:
                 """
                 INSERT INTO work_items (
                     id, module, goal, status, priority, owner_agent, session_key,
-                    decision_required, decision_type, blocked_by_json,
+                    decision_required, decision_type, impl_on_contracts_json, blocked_by_json,
                     artifacts_json, metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.id,
@@ -254,6 +265,7 @@ class WorkflowStore:
                     record.session_key,
                     int(record.decision_required),
                     record.decision_type,
+                    _encode_json(record.impl_on_contracts),
                     _encode_json(record.blocked_by),
                     _encode_json(record.artifacts),
                     _encode_json(record.metadata),
@@ -278,6 +290,7 @@ class WorkflowStore:
             session_key=changes.get("session_key", current.session_key),
             decision_required=changes.get("decision_required", current.decision_required),
             decision_type=changes.get("decision_type", current.decision_type),
+            impl_on_contracts=list(changes.get("impl_on_contracts", current.impl_on_contracts)),
             blocked_by=list(changes.get("blocked_by", current.blocked_by)),
             artifacts=list(changes.get("artifacts", current.artifacts)),
             metadata=dict(changes.get("metadata", current.metadata)),
@@ -291,7 +304,7 @@ class WorkflowStore:
                 UPDATE work_items
                 SET module = ?, goal = ?, status = ?, priority = ?, owner_agent = ?,
                     session_key = ?, decision_required = ?, decision_type = ?,
-                    blocked_by_json = ?, artifacts_json = ?,
+                    impl_on_contracts_json = ?, blocked_by_json = ?, artifacts_json = ?,
                     metadata_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -304,6 +317,7 @@ class WorkflowStore:
                     updated.session_key,
                     int(updated.decision_required),
                     updated.decision_type,
+                    _encode_json(updated.impl_on_contracts),
                     _encode_json(updated.blocked_by),
                     _encode_json(updated.artifacts),
                     _encode_json(updated.metadata),
@@ -765,6 +779,7 @@ class WorkflowStore:
             session_key=row["session_key"],
             decision_required=bool(row["decision_required"]),
             decision_type=row["decision_type"],
+            impl_on_contracts=_decode_json(row["impl_on_contracts_json"], []),
             blocked_by=_decode_json(row["blocked_by_json"], []),
             artifacts=_decode_json(row["artifacts_json"], []),
             metadata=_decode_json(row["metadata_json"], {}),

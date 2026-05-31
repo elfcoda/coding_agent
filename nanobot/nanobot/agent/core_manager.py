@@ -17,6 +17,7 @@ from nanobot.agent.tools.batch_delegate import DelegateProjectsBatchTool
 from nanobot.agent.tools.batch_status import GetBatchDelegationStatusTool
 from nanobot.agent.tools.delegate import DelegateProjectTaskTool
 from nanobot.agent.tools.describe_provider_interfaces import DescribeProviderInterfacesTool
+from nanobot.agent.tools.register_contract_function_dependency import RegisterContractFunctionDependencyTool
 from nanobot.agent.tools.list_project_scopes import ListProjectScopesTool
 from nanobot.agent.tools.request_contract_stub import RequestContractStubTool
 from nanobot.agent.tools.workflow_state import ManageWorkflowStateTool
@@ -158,6 +159,7 @@ class CoreAgentManager:
         self.core_loop.tools.register(GetBatchDelegationStatusTool(self))
         self.core_loop.tools.register(ListProjectScopesTool(self))
         self.core_loop.tools.register(DescribeProviderInterfacesTool(self))
+        self.core_loop.tools.register(RegisterContractFunctionDependencyTool(self))
         self.core_loop.tools.register(RequestContractStubTool(self))
         self.core_loop.tools.register(ManageWorkflowStateTool(self, actor_role="core"))
 
@@ -604,6 +606,118 @@ class CoreAgentManager:
             implementer_work_item_id=contract.work_item_id,
         )
 
+    @staticmethod
+    def _is_contract_function_resolved(status: str) -> bool:
+        return str(status or "").strip() in {"accepted", "implemented", "completed"}
+
+    def _find_contract_function_entry(self, contract: ContractRecord, function_name: str) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+        normalized_name = str(function_name or "").strip()
+        if not normalized_name:
+            raise ValueError("function_name cannot be empty")
+
+        functions = self._effective_contract_functions(contract)
+        for index, item in enumerate(functions):
+            if self._contract_function_key(item) == normalized_name:
+                return index, dict(item), functions
+        raise ValueError(f"Function '{normalized_name}' not found in contract {contract.id}")
+
+    def register_contract_function_dependency(
+        self,
+        *,
+        contract_id: str,
+        function_name: str,
+        dependent_work_item_id: str,
+    ) -> ContractRecord:
+        contract = self.get_contract(contract_id)
+        if contract is None:
+            raise ValueError(f"Unknown contract id: {contract_id}")
+
+        dependent_work_item = self.get_work_item(dependent_work_item_id)
+        if dependent_work_item is None:
+            raise ValueError(f"Unknown work item id: {dependent_work_item_id}")
+
+        function_index, function_entry, functions = self._find_contract_function_entry(contract, function_name)
+        consumer_modules = self._unique_list(
+            [str(module_id).strip() for module_id in function_entry.get("consumer_modules", []) if str(module_id).strip()]
+            + [dependent_work_item.module]
+        )
+        impl_latest_work_item_id = str(
+            function_entry.get("impl_latest_work_item_id") or contract.work_item_id or ""
+        ).strip()
+        updated_function = {
+            **function_entry,
+            "impl_latest_work_item_id": impl_latest_work_item_id,
+            "consumer_modules": consumer_modules,
+        }
+        functions[function_index] = updated_function
+
+        updated_contract = self.update_contract(
+            contract.id,
+            {
+                "functions": functions,
+                "auto_create_dependency_edge": False,
+            },
+        )
+
+        if self._is_contract_function_resolved(updated_function.get("impl_status", "")):
+            return updated_contract
+        if not impl_latest_work_item_id:
+            raise ValueError(
+                f"Contract function '{function_name}' has no impl_latest_work_item_id to depend on"
+            )
+        if impl_latest_work_item_id == dependent_work_item.id:
+            return updated_contract
+
+        existing_edges = self.list_dependency_edges(
+            filters={
+                "source_work_item_id": dependent_work_item.id,
+                "target_work_item_id": impl_latest_work_item_id,
+                "edge_type": "requires_contract_function",
+            },
+            limit=1,
+        )
+        if existing_edges:
+            current = existing_edges[0]
+            existing_metadata = dict(current.metadata or {})
+            existing_contract_ids = [str(item).strip() for item in existing_metadata.get("contract_ids", []) if str(item).strip()]
+            primary_contract_id = str(existing_metadata.get("contract_id") or "").strip()
+            contract_ids = self._unique_list(existing_contract_ids + ([primary_contract_id] if primary_contract_id else []) + [contract.id])
+            function_names = self._unique_list(
+                [str(item).strip() for item in existing_metadata.get("contract_function_names", []) if str(item).strip()]
+                + [self._contract_function_key(updated_function)]
+            )
+            interface_names = self._unique_list(
+                [str(item).strip() for item in existing_metadata.get("interface_names", []) if str(item).strip()]
+                + [contract.interface_name]
+            )
+            next_metadata = {
+                **existing_metadata,
+                "contract_id": primary_contract_id or contract.id,
+                "contract_ids": contract_ids,
+                "contract_function_names": function_names,
+                "interface_name": str(existing_metadata.get("interface_name") or contract.interface_name),
+                "interface_names": interface_names,
+            }
+            self.update_dependency_edge(current.id, {"status": "active", "metadata": next_metadata})
+        else:
+            self.create_dependency_edge(
+                {
+                    "source_work_item_id": dependent_work_item.id,
+                    "target_work_item_id": impl_latest_work_item_id,
+                    "edge_type": "requires_contract_function",
+                    "status": "active",
+                    "metadata": {
+                        "contract_id": contract.id,
+                        "contract_ids": [contract.id],
+                        "contract_function_names": [self._contract_function_key(updated_function)],
+                        "interface_name": contract.interface_name,
+                        "interface_names": [contract.interface_name],
+                    },
+                }
+            )
+
+        return self.get_contract(contract.id) or updated_contract
+
     def _mergeable_contract_candidate(self, fields: dict[str, Any]) -> ContractRecord | None:
         """Find an existing pending contract request that can absorb a duplicate request."""
         status = str(fields.get("status", "requested"))
@@ -768,6 +882,79 @@ class CoreAgentManager:
     def _is_work_item_terminal(status: str) -> bool:
         return status in {"completed", "done", "cancelled"}
 
+    @staticmethod
+    def _is_work_item_dependency_released(status: str) -> bool:
+        return status == "ready" or status in {"completed", "done", "cancelled"}
+
+    def _work_item_execution_has_ended(self, work_item: WorkItemRecord) -> bool:
+        return work_item.status != "running" and work_item.id not in self._running_work_item_dispatches
+
+    def _unresolved_impl_contract_ids(self, work_item: WorkItemRecord) -> list[str]:
+        unresolved: list[str] = []
+        for contract_id in work_item.impl_on_contracts:
+            contract = self.get_contract(contract_id)
+            if contract is None or not self._is_contract_terminal(contract.status):
+                unresolved.append(contract_id)
+        return unresolved
+
+    def _all_impl_contracts_resolved(self, work_item: WorkItemRecord) -> bool:
+        if not work_item.impl_on_contracts:
+            return False
+        for contract_id in work_item.impl_on_contracts:
+            contract = self.get_contract(contract_id)
+            if contract is None or not self._is_contract_resolved(contract.status):
+                return False
+        return True
+
+    def _link_contract_to_work_item(self, work_item_id: str, contract_id: str) -> WorkItemRecord | None:
+        if not work_item_id or not contract_id:
+            return None
+        work_item = self.get_work_item(work_item_id)
+        if work_item is None:
+            return None
+        desired = self._unique_list([item for item in work_item.impl_on_contracts if item] + [contract_id])
+        if desired == list(work_item.impl_on_contracts):
+            return work_item
+        return self.update_work_item(work_item.id, {"impl_on_contracts": desired})
+
+    def _unlink_contract_from_work_item(self, work_item_id: str, contract_id: str) -> WorkItemRecord | None:
+        if not work_item_id or not contract_id:
+            return None
+        work_item = self.get_work_item(work_item_id)
+        if work_item is None:
+            return None
+        desired = [item for item in work_item.impl_on_contracts if item and item != contract_id]
+        if desired == list(work_item.impl_on_contracts):
+            return work_item
+        return self.update_work_item(work_item.id, {"impl_on_contracts": desired})
+
+    def _sync_contract_implementer_membership(
+        self,
+        contract: ContractRecord,
+        *,
+        previous_work_item_id: str = "",
+    ) -> None:
+        current_work_item_id = str(contract.work_item_id or "").strip()
+        previous_work_item_id = str(previous_work_item_id or "").strip()
+        if previous_work_item_id and previous_work_item_id != current_work_item_id:
+            self._unlink_contract_from_work_item(previous_work_item_id, contract.id)
+        if current_work_item_id:
+            self._link_contract_to_work_item(current_work_item_id, contract.id)
+
+    def _edge_should_be_active(self, edge: DependencyEdgeRecord) -> bool:
+        target = self.get_work_item(edge.target_work_item_id)
+        if target is None:
+            return False
+        return not self._is_work_item_dependency_released(target.status)
+
+    def _sync_dependency_edges_for_target(self, work_item_id: str) -> None:
+        edges = self.list_dependency_edges(filters={"target_work_item_id": work_item_id}, limit=2000)
+        for edge in edges:
+            desired_status = "active" if self._edge_should_be_active(edge) else "inactive"
+            if desired_status == edge.status:
+                continue
+            self.update_dependency_edge(edge.id, {"status": desired_status})
+
     def _resolve_contract_consumer_work_item_id(self, contract: ContractRecord, fields: dict[str, Any]) -> str:
         consumer_work_item_id = str(fields.get("consumer_work_item_id") or "").strip()
         if consumer_work_item_id:
@@ -785,10 +972,7 @@ class CoreAgentManager:
         return candidate.id if candidate else ""
 
     def _edge_blocks_work_item(self, edge: DependencyEdgeRecord) -> bool:
-        if edge.status != "active":
-            return False
-        target = self.get_work_item(edge.target_work_item_id)
-        return bool(target and not self._is_work_item_terminal(target.status))
+        return edge.status == "active"
 
     def _sync_work_item_dependency_blockers(self, work_item_id: str) -> WorkItemRecord | None:
         work_item = self.get_work_item(work_item_id)
@@ -816,12 +1000,19 @@ class CoreAgentManager:
             return None
 
         desired_status = work_item.status
-        if self._is_contract_resolved(contract.status):
+        unresolved_contract_ids = self._unresolved_impl_contract_ids(work_item)
+        execution_ended = self._work_item_execution_has_ended(work_item)
+        if self._is_contract_invalidation_status(contract.status) and not self._all_impl_contracts_resolved(work_item):
+            if work_item.status not in {"in_progress", "blocked", "waiting_decision", "running"}:
+                desired_status = "in_progress"
+        elif unresolved_contract_ids:
+            if execution_ended and work_item.status not in {"blocked", "waiting_decision", "running"}:
+                desired_status = "blocked"
+        elif execution_ended and self._all_impl_contracts_resolved(work_item):
             if not self._is_work_item_terminal(work_item.status):
                 desired_status = "completed"
-        elif self._is_contract_invalidation_status(contract.status):
-            if work_item.status not in {"in_progress", "blocked", "waiting_decision"}:
-                desired_status = "in_progress"
+        elif execution_ended and work_item.status == "blocked":
+            desired_status = "ready"
 
         if desired_status == work_item.status:
             return work_item
@@ -892,6 +1083,7 @@ class CoreAgentManager:
 
     def _sync_contract_blocking(self, contract: ContractRecord) -> None:
         """Apply contract lifecycle to the implementing work item and linked dependency blockers."""
+        self._sync_contract_implementer_membership(contract)
         updated_work_item = self._sync_contract_implementation_work_item(contract)
         if updated_work_item is not None:
             self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(updated_work_item))
@@ -909,7 +1101,17 @@ class CoreAgentManager:
 
     def _linked_contract_edges(self, contract_id: str, limit: int = 2000) -> list[DependencyEdgeRecord]:
         edges = self.list_dependency_edges(limit=limit)
-        return [edge for edge in edges if str(edge.metadata.get("contract_id") or "") == contract_id]
+        linked: list[DependencyEdgeRecord] = []
+        for edge in edges:
+            primary_contract_id = str(edge.metadata.get("contract_id") or "")
+            related_contract_ids = {
+                str(item).strip()
+                for item in edge.metadata.get("contract_ids", [])
+                if str(item).strip()
+            }
+            if primary_contract_id == contract_id or contract_id in related_contract_ids:
+                linked.append(edge)
+        return linked
 
     def _resolve_contract_path(self, value: str) -> Path:
         raw = (value or "").strip().replace("\\", "/")
@@ -1179,6 +1381,11 @@ class CoreAgentManager:
             edges = self.list_dependency_edges(filters={"source_work_item_id": work_item.id}, limit=100)
             blocking_edge_ids = [edge.id for edge in edges if self._edge_blocks_work_item(edge)]
             blockers.extend([f"dependency:{edge_id}" for edge_id in blocking_edge_ids])
+
+            unresolved_impl_contract_ids = self._unresolved_impl_contract_ids(work_item)
+            blockers.extend([f"impl_contract:{contract_id}" for contract_id in unresolved_impl_contract_ids])
+            if work_item.impl_on_contracts and not self._work_item_execution_has_ended(work_item):
+                blockers.append("execution:running")
 
             edge_ids = {edge.id for edge in edges}
             manual_blockers = [entry for entry in work_item.blocked_by if entry not in edge_ids]
@@ -1625,6 +1832,14 @@ class CoreAgentManager:
                 }
             )
             next_status = "in_progress" if latest.status == "running" else latest.status
+            if latest.status == "running" and latest.impl_on_contracts:
+                edges = self.list_dependency_edges(filters={"source_work_item_id": latest.id}, limit=200)
+                edge_ids = {edge.id for edge in edges}
+                manual_blockers = [entry for entry in latest.blocked_by if entry not in edge_ids]
+                if self._unresolved_impl_contract_ids(latest) or manual_blockers or any(self._edge_blocks_work_item(edge) for edge in edges):
+                    next_status = "blocked"
+                else:
+                    next_status = "ready"
             updated = self.update_work_item(
                 latest.id,
                 {
@@ -1855,12 +2070,14 @@ class CoreAgentManager:
             session_key=str(fields.get("session_key", "")),
             decision_required=bool(fields.get("decision_required", False)),
             decision_type=str(fields.get("decision_type", "")),
+            impl_on_contracts=list(fields.get("impl_on_contracts", [])),
             blocked_by=list(fields.get("blocked_by", [])),
             artifacts=list(fields.get("artifacts", [])),
             metadata=metadata,
         )
         created = self.workflow_store.create_work_item(record)
         self._emit_workflow_event("workflow.work_item.created", self._serialize_workflow_record(created))
+        self._sync_dependency_edges_for_target(created.id)
         return created
 
     def get_work_item(self, record_id: str) -> WorkItemRecord | None:
@@ -1879,6 +2096,7 @@ class CoreAgentManager:
     def update_work_item(self, record_id: str, changes: dict[str, Any]) -> WorkItemRecord:
         updated = self.workflow_store.update_work_item(record_id, **changes)
         self._emit_workflow_event("workflow.work_item.updated", self._serialize_workflow_record(updated))
+        self._sync_dependency_edges_for_target(updated.id)
         return updated
 
     def delete_work_item(self, record_id: str) -> bool:
@@ -1929,6 +2147,7 @@ class CoreAgentManager:
             metadata=incoming_metadata,
         )
         created = self.workflow_store.create_contract(record)
+        self._sync_contract_implementer_membership(created)
         self._emit_workflow_event("workflow.contract.created", self._serialize_workflow_record(created))
         self._apply_contract_side_effects(created, fields)
         return created
@@ -2095,6 +2314,7 @@ class CoreAgentManager:
                 existing_functions=previous.functions,
             )
         updated = self.workflow_store.update_contract(record_id, **normalized_changes)
+        self._sync_contract_implementer_membership(updated, previous_work_item_id=previous.work_item_id)
         if self._is_contract_terminal(updated.status):
             lifecycle = dict(updated.metadata.get("lifecycle", {}))
             if not lifecycle.get("resolved_at"):
@@ -2106,7 +2326,10 @@ class CoreAgentManager:
         return updated
 
     def delete_contract(self, record_id: str) -> bool:
+        previous = self.get_contract(record_id)
         deleted = self.workflow_store.delete_contract(record_id)
+        if deleted and previous is not None:
+            self._unlink_contract_from_work_item(previous.work_item_id, previous.id)
         self._emit_workflow_event("workflow.contract.deleted", {"id": record_id, "deleted": deleted})
         return deleted
 
@@ -2120,6 +2343,7 @@ class CoreAgentManager:
             metadata=dict(fields.get("metadata", {})),
         )
         created = self.workflow_store.create_dependency_edge(record)
+        self._sync_dependency_edges_for_target(created.target_work_item_id)
         self._sync_work_item_dependency_blockers(created.source_work_item_id)
         self._emit_workflow_event("workflow.dependency_edge.created", self._serialize_workflow_record(created))
         return created
@@ -2524,6 +2748,7 @@ class CoreAgentManager:
                 )
             )
             loop.tools.register(DescribeProviderInterfacesTool(self))
+            loop.tools.register(RegisterContractFunctionDependencyTool(self))
             self.project_loops[normalized] = loop
         return loop
 
