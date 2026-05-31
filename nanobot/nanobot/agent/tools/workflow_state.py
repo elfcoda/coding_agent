@@ -11,8 +11,18 @@ if TYPE_CHECKING:
 class ManageWorkflowStateTool(Tool):
     """Create, inspect, list, update, and delete workflow state records."""
 
-    def __init__(self, manager: "CoreAgentManager"):
+    def __init__(
+        self,
+        manager: "CoreAgentManager",
+        *,
+        allowed_entities: list[str] | None = None,
+        allowed_actions: list[str] | None = None,
+        actor_role: str = "core",
+    ):
         self._manager = manager
+        self._allowed_entities = allowed_entities or ["work_item", "contract", "dependency_edge", "decision", "scheduler"]
+        self._allowed_actions = allowed_actions or ["create", "get", "list", "update", "delete", "tick"]
+        self._actor_role = actor_role
 
     @property
     def name(self) -> str:
@@ -22,7 +32,8 @@ class ManageWorkflowStateTool(Tool):
     def description(self) -> str:
         return (
             "Manage orchestration workflow records for work items, contracts, dependency edges, and decisions. "
-            "Use this to persist and inspect structured workflow state instead of relying on free-form text."
+            "Use this to persist and inspect structured workflow state instead of relying on free-form text. "
+            "All requests are executed through the core manager."
         )
 
     @property
@@ -32,12 +43,12 @@ class ManageWorkflowStateTool(Tool):
             "properties": {
                 "entity": {
                     "type": "string",
-                    "enum": ["work_item", "contract", "dependency_edge", "decision", "scheduler"],
+                    "enum": list(self._allowed_entities),
                     "description": "Workflow entity type to manage",
                 },
                 "action": {
                     "type": "string",
-                    "enum": ["create", "get", "list", "update", "delete", "tick"],
+                    "enum": list(self._allowed_actions),
                     "description": "Operation to perform on the workflow entity",
                 },
                 "record_id": {
@@ -72,6 +83,11 @@ class ManageWorkflowStateTool(Tool):
         limit: int = 100,
         **kwargs: Any,
     ) -> str:
+        if entity not in self._allowed_entities:
+            raise ValueError(f"Role '{self._actor_role}' cannot access workflow entity: {entity}")
+        if action not in self._allowed_actions:
+            raise ValueError(f"Role '{self._actor_role}' cannot perform workflow action: {action}")
+
         return self._manager.manage_workflow_state(
             entity=entity,
             action=action,

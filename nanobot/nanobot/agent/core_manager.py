@@ -16,6 +16,7 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.batch_delegate import DelegateProjectsBatchTool
 from nanobot.agent.tools.batch_status import GetBatchDelegationStatusTool
 from nanobot.agent.tools.delegate import DelegateProjectTaskTool
+from nanobot.agent.tools.describe_provider_interfaces import DescribeProviderInterfacesTool
 from nanobot.agent.tools.list_project_scopes import ListProjectScopesTool
 from nanobot.agent.tools.request_contract_stub import RequestContractStubTool
 from nanobot.agent.tools.workflow_state import ManageWorkflowStateTool
@@ -156,8 +157,9 @@ class CoreAgentManager:
         self.core_loop.tools.register(DelegateProjectsBatchTool(self))
         self.core_loop.tools.register(GetBatchDelegationStatusTool(self))
         self.core_loop.tools.register(ListProjectScopesTool(self))
+        self.core_loop.tools.register(DescribeProviderInterfacesTool(self))
         self.core_loop.tools.register(RequestContractStubTool(self))
-        self.core_loop.tools.register(ManageWorkflowStateTool(self))
+        self.core_loop.tools.register(ManageWorkflowStateTool(self, actor_role="core"))
 
     @staticmethod
     def _to_snake_case(value: str) -> str:
@@ -507,6 +509,101 @@ class CoreAgentManager:
     def _is_decision_terminal(status: str) -> bool:
         return status in {"approved", "rejected", "completed"}
 
+    @staticmethod
+    def _contract_function_key(function: dict[str, Any]) -> str:
+        name = str(function.get("name") or "").strip()
+        if name:
+            return name
+        sig = str(function.get("sig") or "").strip()
+        return sig
+
+    def _normalize_contract_functions(
+        self,
+        raw_functions: list[dict[str, Any]] | None,
+        *,
+        consumer_module: str,
+        implementer_work_item_id: str,
+        existing_functions: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        existing_functions = [dict(item) for item in (existing_functions or []) if isinstance(item, dict)]
+        existing_by_key = {
+            self._contract_function_key(item): dict(item)
+            for item in existing_functions
+            if self._contract_function_key(item)
+        }
+        order = [self._contract_function_key(item) for item in existing_functions if self._contract_function_key(item)]
+
+        normalized: dict[str, dict[str, Any]] = {}
+        for key, item in existing_by_key.items():
+            normalized[key] = dict(item)
+
+        for item in raw_functions or []:
+            if not isinstance(item, dict):
+                continue
+            key = self._contract_function_key(item)
+            if not key:
+                continue
+            previous = normalized.get(key, {})
+            consumer_modules = self._unique_list(
+                [str(module_id).strip() for module_id in previous.get("consumer_modules", []) if str(module_id).strip()]
+                + [str(module_id).strip() for module_id in item.get("consumer_modules", []) if str(module_id).strip()]
+                + ([consumer_module] if consumer_module else [])
+            )
+            normalized[key] = {
+                "name": str(item.get("name") or previous.get("name") or "").strip() or key,
+                "sig": str(item.get("sig") or previous.get("sig") or "").strip(),
+                "desc": str(item.get("desc") or previous.get("desc") or "").strip(),
+                "impl_status": str(item.get("impl_status") or previous.get("impl_status") or "").strip(),
+                "impl_latest_work_item_id": str(
+                    item.get("impl_latest_work_item_id")
+                    or implementer_work_item_id
+                    or previous.get("impl_latest_work_item_id")
+                    or ""
+                ).strip(),
+                "consumer_modules": consumer_modules,
+            }
+            if key not in order:
+                order.append(key)
+
+        result: list[dict[str, Any]] = []
+        for key in order:
+            item = normalized.get(key)
+            if item is None:
+                continue
+            if not item.get("consumer_modules") and consumer_module:
+                item = {**item, "consumer_modules": [consumer_module]}
+            result.append(item)
+        return result
+
+    def _incoming_contract_functions(
+        self,
+        fields: dict[str, Any],
+        *,
+        consumer_module: str,
+        implementer_work_item_id: str,
+        existing_functions: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        if "functions" in fields:
+            raw_functions = fields.get("functions") or []
+        else:
+            spec = dict(fields.get("spec") or {})
+            raw_functions = spec.get("functions") if isinstance(spec.get("functions"), list) else None
+        return self._normalize_contract_functions(
+            raw_functions,
+            consumer_module=consumer_module,
+            implementer_work_item_id=implementer_work_item_id,
+            existing_functions=existing_functions,
+        )
+
+    def _effective_contract_functions(self, contract: ContractRecord) -> list[dict[str, Any]]:
+        spec = dict(contract.spec or {})
+        spec_functions = spec.get("functions") if isinstance(spec.get("functions"), list) else None
+        return self._normalize_contract_functions(
+            contract.functions or spec_functions,
+            consumer_module=contract.consumer_module,
+            implementer_work_item_id=contract.work_item_id,
+        )
+
     def _mergeable_contract_candidate(self, fields: dict[str, Any]) -> ContractRecord | None:
         """Find an existing pending contract request that can absorb a duplicate request."""
         status = str(fields.get("status", "requested"))
@@ -621,6 +718,14 @@ class CoreAgentManager:
         incoming_spec = dict(fields.get("spec", {}))
         if not existing.spec and incoming_spec:
             changes["spec"] = incoming_spec
+        incoming_functions = self._incoming_contract_functions(
+            fields,
+            consumer_module=str(fields.get("consumer_module") or existing.consumer_module),
+            implementer_work_item_id=incoming_implementer_work_item_id or existing.work_item_id,
+            existing_functions=existing.functions,
+        )
+        if incoming_functions:
+            changes["functions"] = incoming_functions
         incoming_stub_path = str(fields.get("stub_path") or "")
         if not existing.stub_path and incoming_stub_path:
             changes["stub_path"] = incoming_stub_path
@@ -1812,6 +1917,11 @@ class CoreAgentManager:
             interface_name=str(fields["interface_name"]),
             version=int(fields.get("version", 1)),
             status=str(fields.get("status", "requested")),
+            functions=self._incoming_contract_functions(
+                fields,
+                consumer_module=str(fields["consumer_module"]),
+                implementer_work_item_id=implementer_work_item_id,
+            ),
             spec=dict(fields.get("spec", {})),
             stub_path=str(fields.get("stub_path", "")),
             implementation_path=str(fields.get("implementation_path", "")),
@@ -1837,6 +1947,87 @@ class CoreAgentManager:
             limit=limit,
         )
 
+    def describe_provider_interfaces(self, provider_module: str, *, limit: int = 500) -> dict[str, Any]:
+        provider = str(provider_module or "").strip()
+        if not provider:
+            raise ValueError("provider_module cannot be empty")
+
+        contracts = self.list_contracts(filters={"provider_module": provider}, limit=max(1, limit))
+        grouped: dict[str, list[ContractRecord]] = {}
+        for contract in contracts:
+            grouped.setdefault(contract.interface_name, []).append(contract)
+
+        interfaces: list[dict[str, Any]] = []
+        for interface_name in sorted(grouped, key=str.lower):
+            interface_contracts = sorted(
+                grouped[interface_name],
+                key=lambda record: (int(record.version), str(record.created_at), str(record.updated_at), record.id),
+            )
+
+            consumer_modules = self._unique_list([contract.consumer_module for contract in interface_contracts if contract.consumer_module])
+            available_versions = sorted({int(contract.version) for contract in interface_contracts})
+            statuses = self._unique_list([str(contract.status).strip() for contract in interface_contracts if str(contract.status).strip()])
+
+            merged_functions: list[dict[str, Any]] = []
+            for contract in interface_contracts:
+                merged_functions = self._normalize_contract_functions(
+                    self._effective_contract_functions(contract),
+                    consumer_module=contract.consumer_module,
+                    implementer_work_item_id=contract.work_item_id,
+                    existing_functions=merged_functions,
+                )
+
+            interfaces.append(
+                {
+                    "interface_name": interface_name,
+                    "latest_version": available_versions[-1] if available_versions else 0,
+                    "available_versions": available_versions,
+                    "statuses": statuses,
+                    "consumer_modules": consumer_modules,
+                    "contract_ids": [contract.id for contract in interface_contracts],
+                    "function_count": len(merged_functions),
+                    "functions": merged_functions,
+                }
+            )
+
+        if interfaces:
+            lines = [
+                f"Provider module: {provider}",
+                "Known reusable interfaces and functions:",
+            ]
+            for index, interface in enumerate(interfaces, start=1):
+                consumers = ", ".join(interface["consumer_modules"]) or "none"
+                statuses_text = ", ".join(interface["statuses"]) or "unknown"
+                lines.append(
+                    f"{index}. {interface['interface_name']}"
+                    f" (latest_version={interface['latest_version']}; statuses={statuses_text}; consumers={consumers})"
+                )
+                for function in interface["functions"]:
+                    function_consumers = ", ".join(function.get("consumer_modules", [])) or "none"
+                    signature = function.get("sig") or function.get("name") or "<unknown>"
+                    impl_status = function.get("impl_status") or "unknown"
+                    desc = function.get("desc") or ""
+                    suffix = f" - {desc}" if desc else ""
+                    lines.append(
+                        f"   - {function.get('name') or signature}: {signature} [{impl_status}] consumers={function_consumers}{suffix}"
+                    )
+            lines.append("Reuse an existing interface/function when semantics already match.")
+            lines.append("If none fit, request a contract change or a new contract.")
+            llm_prompt = "\n".join(lines)
+        else:
+            llm_prompt = (
+                f"Provider module: {provider}\n"
+                "Known reusable interfaces and functions: none.\n"
+                "If you need cross-module functionality here, request a new contract."
+            )
+
+        return {
+            "provider_module": provider,
+            "interface_count": len(interfaces),
+            "interfaces": interfaces,
+            "llm_prompt": llm_prompt,
+        }
+
     def get_contract_merge_audit(self, contract_id: str) -> dict[str, Any] | None:
         """Return one contract's merge audit view for UI/decision auditing."""
         contract = self.get_contract(contract_id)
@@ -1855,6 +2046,7 @@ class CoreAgentManager:
             "interface_name": contract.interface_name,
             "version": contract.version,
             "status": contract.status,
+            "functions": [dict(item) for item in contract.functions],
             "merged_request_count": merged_request_count,
             "dedupe_mode": metadata.get("dedupe_mode", "none"),
             "first_seen_at": str(merge_audit.get("first_seen_at") or contract.created_at),
@@ -1887,15 +2079,30 @@ class CoreAgentManager:
         previous = self.get_contract(record_id)
         if previous is None:
             raise ValueError(f"Unknown contract id: {record_id}")
-        updated = self.workflow_store.update_contract(record_id, **changes)
+        normalized_changes = dict(changes)
+        if "functions" in normalized_changes or "spec" in normalized_changes:
+            implementer_work_item_id = str(
+                normalized_changes.get("work_item_id")
+                or normalized_changes.get("provider_work_item_id")
+                or previous.work_item_id
+                or ""
+            ).strip()
+            consumer_module = str(normalized_changes.get("consumer_module") or previous.consumer_module)
+            normalized_changes["functions"] = self._incoming_contract_functions(
+                normalized_changes,
+                consumer_module=consumer_module,
+                implementer_work_item_id=implementer_work_item_id,
+                existing_functions=previous.functions,
+            )
+        updated = self.workflow_store.update_contract(record_id, **normalized_changes)
         if self._is_contract_terminal(updated.status):
             lifecycle = dict(updated.metadata.get("lifecycle", {}))
             if not lifecycle.get("resolved_at"):
                 lifecycle["resolved_at"] = self._now_iso()
                 updated = self.workflow_store.update_contract(record_id, metadata={**updated.metadata, "lifecycle": lifecycle})
         self._emit_workflow_event("workflow.contract.updated", self._serialize_workflow_record(updated))
-        self._apply_contract_side_effects(updated, changes)
-        self._apply_contract_version_invalidation(previous, updated, changes)
+        self._apply_contract_side_effects(updated, normalized_changes)
+        self._apply_contract_version_invalidation(previous, updated, normalized_changes)
         return updated
 
     def delete_contract(self, record_id: str) -> bool:
@@ -2308,6 +2515,15 @@ class CoreAgentManager:
                 scope_hint="\n".join(scope_lines),
                 enable_message_tool=False,
             )
+            loop.tools.register(
+                ManageWorkflowStateTool(
+                    self,
+                    allowed_entities=["work_item", "contract", "dependency_edge", "decision"],
+                    allowed_actions=["create", "get", "list", "update"],
+                    actor_role=f"project:{normalized}",
+                )
+            )
+            loop.tools.register(DescribeProviderInterfacesTool(self))
             self.project_loops[normalized] = loop
         return loop
 

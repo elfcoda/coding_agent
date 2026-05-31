@@ -57,6 +57,7 @@ class ContractRecord:
     interface_name: str
     version: int = 1
     status: str = "requested"
+    functions: list[dict[str, Any]] = field(default_factory=list)
     spec: dict[str, Any] = field(default_factory=dict)
     stub_path: str = ""
     implementation_path: str = ""
@@ -156,6 +157,7 @@ class WorkflowStore:
                     interface_name TEXT NOT NULL,
                     version INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL,
+                    functions_json TEXT NOT NULL DEFAULT '[]',
                     spec_json TEXT NOT NULL DEFAULT '{}',
                     stub_path TEXT NOT NULL DEFAULT '',
                     implementation_path TEXT NOT NULL DEFAULT '',
@@ -223,6 +225,14 @@ class WorkflowStore:
                 CREATE INDEX IF NOT EXISTS idx_metrics_snapshots_generated_at ON metrics_snapshots(generated_at);
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(contracts)").fetchall()
+            }
+            if "functions_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE contracts ADD COLUMN functions_json TEXT NOT NULL DEFAULT '[]'"
+                )
 
     def create_work_item(self, record: WorkItemRecord) -> WorkItemRecord:
         with self._connect() as connection:
@@ -356,9 +366,9 @@ class WorkflowStore:
                 """
                 INSERT INTO contracts (
                     id, provider_module, consumer_module, interface_name, version, status,
-                    spec_json, stub_path, implementation_path, work_item_id, metadata_json,
+                    functions_json, spec_json, stub_path, implementation_path, work_item_id, metadata_json,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.id,
@@ -367,6 +377,7 @@ class WorkflowStore:
                     record.interface_name,
                     record.version,
                     record.status,
+                    _encode_json(record.functions),
                     _encode_json(record.spec),
                     record.stub_path,
                     record.implementation_path,
@@ -390,6 +401,7 @@ class WorkflowStore:
             interface_name=changes.get("interface_name", current.interface_name),
             version=changes.get("version", current.version),
             status=changes.get("status", current.status),
+            functions=[dict(item) for item in changes.get("functions", current.functions)],
             spec=dict(changes.get("spec", current.spec)),
             stub_path=changes.get("stub_path", current.stub_path),
             implementation_path=changes.get("implementation_path", current.implementation_path),
@@ -404,7 +416,7 @@ class WorkflowStore:
                 """
                 UPDATE contracts
                 SET provider_module = ?, consumer_module = ?, interface_name = ?, version = ?,
-                    status = ?, spec_json = ?, stub_path = ?, implementation_path = ?,
+                    status = ?, functions_json = ?, spec_json = ?, stub_path = ?, implementation_path = ?,
                     work_item_id = ?, metadata_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -414,6 +426,7 @@ class WorkflowStore:
                     updated.interface_name,
                     updated.version,
                     updated.status,
+                    _encode_json(updated.functions),
                     _encode_json(updated.spec),
                     updated.stub_path,
                     updated.implementation_path,
@@ -767,6 +780,7 @@ class WorkflowStore:
             interface_name=row["interface_name"],
             version=row["version"],
             status=row["status"],
+            functions=_decode_json(row["functions_json"], []),
             spec=_decode_json(row["spec_json"], {}),
             stub_path=row["stub_path"],
             implementation_path=row["implementation_path"],
