@@ -154,5 +154,22 @@ demo阶段只做简单demo和核心模块，尽量别去整理edge case，只演
 
 
 
-
-
+一个不断输入不断决策（各种类别的decision）的系统：（强迫开发者去掌握本该自己掌握的部分，阻止失控）decision剥离分发器
+1. 低熵体agent：把superpower和openspec是通过prompt把不确定性还给llm，而静态分析的做法，和版本低状态转移管理，本质上是有意识的构建本地的有序系统，把本该属于agent编排的确定性归还给agent，把不确定性从大模型侧转移到agent侧的确定性，减少系统整体的熵。
+2. 从chat-first到decision-first的范式转移：
+    为什么：面向的用户不再是一句话生成简单app的用户，而是长期维护一套复杂系统的开发者，这些开发者靠vibe不可能构建可靠的系统，而古法又太慢，古法配合ai的垂直工作流是靠谱的方式。本质上说是把一个复杂项目按置信度划分成两块，一块是util工具类，common如排序，数据库接入，网络收发，api脚手架和增删改查，或者业务间很确定的关系，这些置信度很高的，ai能直接判断出大概率能做的，帮开发者解决这些。另一块是复杂的具体的业务逻辑，系统状态的转移，字段的取舍，架构的扩展和优化，整体系统的规划这些开发者一开始可能确定不了，是和业务绑定的多变的，ai靠概率不可能精确捕捉的。这俩靠ai区分出来，ai完成第1块，把第二块从完整的项目里剥离出来，形成一个个开发者需要去decision的小task，那么agent系统就成了decision分发器，（整个系统就低熵了）。因为本质上说，一个风格化产品不可能早期几句话就说清楚，开发者必须实时掌控项目架构所有，开发者在开发的过程中的作用，除了编码，还有不断给系统输入信息，去完成系统的整体走向，在软件开发过程中，人的这个外部信息的不断输入的，所以也对应了从系统拆分出来的decisions，人靠decision不断输入。好处是，传统chat-first只有在一轮长的chat结束后才能做简单decision，中间的coding元素是不受控的，而且有很大的回滚的风险和对项目的不确定性。在decision里，一个task被分成细粒度的小task，人始终是在控制项目，并且人一直在做高效的decision，也就是项目本来就需要你做的，agent这里是个decision分发器，形成高密度的低延迟的decision。本质上说，项目是可以由decision组成的。
+    传统agent的架构：参考deer-flow，人有在human-loop里，但是参与度太少，粒度太大，风险大，序列模型是question - thinking - answer - human-decision - merge/revert，而这里的架构是持续输入持续decision流，他把chat之后才能进行的human-decision变成了持续的流feed给开发者。
+    架构设计：同时，为了支持高效提取decision，系统支持高并行agent，把项目划分成多个module，module间互相独立，使用接口依赖通信（契约实现，原生高并行），意味着从传统2层agent架构变成了core agent - module agent - sub agent 3层架构，从而支持互相独立的高并行agent从而产生不断的小decision，当一个decision反馈block时，其他agent的decision又done了，形成了延迟掩盖，于是就有了高并行的agent下的decision高效决策控制台，所以前端才会变成这个样子，他不只是ui的改变，而是范式的转变。
+    系统架构是：每个module有个project agent，module会接受来自core的task形成work item，由sub agent负责，一个project agent对应多个work item，每个work item对应有多个decision，decision排列后会向前端汇报。不同的work item会有依赖边，代表这个work item请求另一个module的接口，要去实现，如果还没实现则block。但是为了高并行，这里的block不是指这个task不执行了，这儿task会假设未来这个接口会被掐module实现，所以会继续往下执行，以此形成高并行。依赖边影响的是verify路径，只有graph的依赖完成了，系统才能verify。而contract字段记录的是不同module的自定义的对外接口和依赖，用来处理重构时模块间的依赖问题，是静态的。
+状态转移：
+1. 依赖的DependencyEdgeRecord都已经inactive
+2. impl_on_contracts里是的contract都已经完结
+3. 当前work item的执行进程已结束
+当以上3个条件都满足，当前work item就取消block阻塞状态。
+判定时机包含以下：
+1. 当一个work item进程结束返回给core manager后
+2. 当scheduler循环扫描发现有contract的状态发生变化为完结
+3. 当某个work item被取消block状态导致依赖边变成inactive后
+    系统运行：core manager启动后会在后台起一个扫描任务和不断更新状态的任务去触发，主进程则是不断loop接收用户的发来的消息，派发project  agent去形成work item，来持续输入持续生成decision给前端决策。
+    处理：edge case工程问题都会有，这里不管edge case，也先不管重构需求和其他需求，不管verify，只管核心工作流在mock llm后是否能跑通。前端管breakdown，监控，aspire（高熵提供灵感），附加attach，持续输入持续decision，多模态输入，接收msgs并decision的feature，复杂的由e2e处理，在demo期只做这些。
+    最后：要能做demo，但是系统架构，状态流转，设计原理，核心流程要懂。其他的不用做，不用做完整，没人问。
