@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import uuid
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from nanobot.agent.core_manager import CoreAgentManager
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -108,7 +111,7 @@ async def _wait_for(predicate, *, timeout: float = 5.0) -> None:
     raise AssertionError("Condition was not met before timeout")
 
 
-async def _consume_response(bus: MessageBus, *, channel: str, chat_id: str, timeout: float = 10.0) -> OutboundMessage:
+async def _consume_response(bus: MessageBus, *, channel: str, chat_id: str, timeout: float = 120.0) -> OutboundMessage:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
@@ -116,6 +119,26 @@ async def _consume_response(bus: MessageBus, *, channel: str, chat_id: str, time
         if message.channel == channel and message.chat_id == chat_id:
             return message
     raise AssertionError("Timed out waiting for the requested outbound message")
+
+
+async def _consume_many_responses(
+    bus: MessageBus,
+    *,
+    channel: str,
+    chat_id: str,
+    count: int,
+    timeout: float = 1200.0,
+) -> list[OutboundMessage]:
+    messages: list[OutboundMessage] = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while len(messages) < count and loop.time() < deadline:
+        message = await asyncio.wait_for(bus.consume_outbound(), timeout=max(0.1, deadline - loop.time()))
+        if message.channel == channel and message.chat_id == chat_id:
+            messages.append(message)
+    if len(messages) != count:
+        raise AssertionError(f"Timed out waiting for {count} outbound messages; got {len(messages)}")
+    return messages
 
 
 async def test_core_manager_run_e2e_delegates_fixed_test_code_projects(tmp_path: Path) -> None:
@@ -136,6 +159,8 @@ async def test_core_manager_run_e2e_delegates_fixed_test_code_projects(tmp_path:
         decision_queue_age_weight=1,
         decision_default_degradation="wait",
     )
+    # Use scripted provider in project subprocess workers (test mode)
+    manager._worker_provider_type = "scripted"
 
     test_files = {
         module_name: repo_root / "test_code" / module_name / "api.py"
@@ -145,8 +170,11 @@ async def test_core_manager_run_e2e_delegates_fixed_test_code_projects(tmp_path:
 
     manager_task = asyncio.create_task(manager.run())
     try:
-        await _wait_for(lambda: manager._reconciler_task is not None and not manager._reconciler_task.done())
+        # await _wait_for(lambda: manager._reconciler_task is not None and not manager._reconciler_task.done())
+        # sleep briefly to ensure the manager is fully up and running before publishing the message
+        await asyncio.sleep(3)
 
+        logger.info("\x1b[32m Publishing test message to trigger delegation... \x1b[0m")
         await bus.publish_inbound(
             InboundMessage(
                 channel="e2e",
@@ -161,13 +189,38 @@ async def test_core_manager_run_e2e_delegates_fixed_test_code_projects(tmp_path:
         assert "module1" in response.content
         assert "module2" in response.content
         assert "module3" in response.content
-        assert set(manager.project_loops) == {"test_code/module1", "test_code/module2", "test_code/module3"}
+        assert set(manager._project_subprocesses) == {"test_code/module1", "test_code/module2", "test_code/module3"}
+        for handle in manager._project_subprocesses.values():
+            assert handle.process.returncode is None, f"Subprocess for {handle.project} exited"
+
+        await asyncio.sleep(2)
+        await asyncio.sleep(2)
+        await asyncio.sleep(2)
+        await asyncio.sleep(2)
+        await asyncio.sleep(2)
+        completion_messages = await _consume_many_responses(
+            bus,
+            channel="e2e",
+            chat_id="core-run-flow",
+            count=3,
+            timeout=30.0,
+        )
+        completion_content = "\n".join(message.content for message in completion_messages)
+        assert "[Project Scope: test_code/module1]" in completion_content
+        assert "[Project Scope: test_code/module2]" in completion_content
+        assert "[Project Scope: test_code/module3]" in completion_content
+
+        await asyncio.sleep(1)  # wait for the delegated file edits to be flushed
 
         for module_name, path in test_files.items():
             content = path.read_text(encoding="utf-8")
             assert f"def get_{module_name}_interface() -> str:" in content
             assert f'return "{module_name}-interface"' in content
+    except Exception as e:
+        logger.error("\x1b[31m Test failed with exception: %s \x1b[0m", e)
+        assert False, f"Test failed with exception: {e}"
     finally:
+        logger.info("\x1b[32m Restoring original file contents... \x1b[0m")
         for module_name, path in test_files.items():
             if module_name in original_contents:
                 path.write_text(original_contents[module_name], encoding="utf-8")

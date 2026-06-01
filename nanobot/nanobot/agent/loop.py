@@ -480,6 +480,19 @@ class AgentLoop:
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
 
+        if bool((msg.metadata or {}).get("passthrough")):
+            session_key = f"{origin_channel}:{origin_chat_id}"
+            session = self.sessions.get_or_create(session_key)
+            session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
+            session.add_message("assistant", msg.content)
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=origin_channel,
+                chat_id=origin_chat_id,
+                content=msg.content,
+                metadata=msg.metadata or {},
+            )
+
         # Use the origin session for context
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)

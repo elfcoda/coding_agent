@@ -1,4 +1,4 @@
-"""Thin coordinator over a core agent and project-scoped agent loops."""
+"""Thin coordinator over a core agent and project-scoped agent subprocesses."""
 
 from __future__ import annotations
 
@@ -6,8 +6,9 @@ import asyncio
 import uuid
 import json
 import re
+import signal as signal_module
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -50,8 +51,36 @@ class ProjectScopeRegistration:
     tags: tuple[str, ...] = ()
 
 
+@dataclass
+class ProjectSubprocessHandle:
+    """Handle for a running project agent subprocess."""
+
+    project: str
+    process: asyncio.subprocess.Process
+    pid: int
+    started_at: str
+    scope_hint: str = ""
+    reader_task: asyncio.Task[None] | None = None
+    pending_requests: dict[str, "PendingProjectRequest"] = field(default_factory=dict)
+
+
+@dataclass
+class PendingProjectRequest:
+    """Tracked request routed through a project subprocess."""
+
+    request_id: str
+    project: str
+    channel: str
+    chat_id: str
+    session_key: str
+    submitted_at: str
+    task_preview: str
+    publish_completion_message: bool = True
+    future: asyncio.Future[dict[str, Any]] | None = None
+
+
 class CoreAgentManager:
-    """Coordinate a core agent and lazily-created project agents."""
+    """Coordinate a core agent and project-scoped agent subprocesses."""
 
     def __init__(
         self,
@@ -68,7 +97,7 @@ class CoreAgentManager:
         allowed_project_scopes: list[str] | None = None,
         project_registry: list[Any] | None = None,
         workflow_store: WorkflowStore | None = None,
-        scheduler_reconcile_interval_seconds: float = 3.0,
+        scheduler_reconcile_interval_seconds: float = 0.5, # 3.0,
         scheduler_max_concurrent_dispatches: int = 4,
         revalidation_chain_enabled: bool = False,
         revalidation_chain_edge_types: list[str] | None = None,
@@ -93,6 +122,10 @@ class CoreAgentManager:
         self.sessions = session_manager or SessionManager(self.workspace)
         self.workflow_store = workflow_store or WorkflowStore(get_data_dir() / "workflow" / "state.db")
         self.project_loops: dict[str, AgentLoop] = {}
+        self._project_subprocesses: dict[str, ProjectSubprocessHandle] = {}
+        self._next_subprocess_req_id: int = 0
+        self._config_path: str | None = None
+        self._worker_provider_type: str = "litellm"  # "litellm" or "scripted"
         self._running_batch_tasks: dict[str, asyncio.Task[None]] = {}
         self._batch_status: dict[str, dict[str, Any]] = {}
         self._reconciler_interval_seconds = max(0.2, float(scheduler_reconcile_interval_seconds))
@@ -1811,13 +1844,16 @@ class CoreAgentManager:
         started_at = self._now_iso()
         queue_wait_seconds = self._seconds_between(item.metadata.get("scheduler", {}).get("ready_since"), started_at) or 0.0
         try:
-            result = await self.delegate_project_task(
+            request_state = await self._submit_project_task(
                 project=item.module,
                 task=item.goal,
                 session_key=session_key,
                 channel="workflow",
                 chat_id=f"work_item:{item.id}",
+                publish_completion_message=False,
             )
+            response = await asyncio.wait_for(request_state.future, timeout=1200.0)
+            result = f"[Project Scope: {item.module}]\n{str(response.get('result') or '')}"
             latest = self.get_work_item(work_item_id)
             if latest is None:
                 return
@@ -2049,6 +2085,46 @@ class CoreAgentManager:
             dispatch_task.cancel()
         if dispatch_tasks:
             await asyncio.gather(*dispatch_tasks, return_exceptions=True)
+
+    async def _shutdown_project_subprocesses(self) -> None:
+        """Terminate project subprocesses and wait for their transports to close cleanly."""
+        handles = list(self._project_subprocesses.values())
+        self._project_subprocesses.clear()
+        self.project_loops.clear()
+
+        for handle in handles:
+            process = handle.process
+            if process.returncode is not None:
+                continue
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+            except Exception:
+                pass
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+
+        for handle in handles:
+            process = handle.process
+            if process.returncode is None:
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    except Exception:
+                        pass
+                    await asyncio.gather(process.wait(), return_exceptions=True)
+
+        reader_tasks = [handle.reader_task for handle in handles if handle.reader_task is not None]
+        if reader_tasks:
+            await asyncio.gather(*reader_tasks, return_exceptions=True)
 
     def _serialize_workflow_record(self, record: Any) -> dict[str, Any]:
         return asdict(record)
@@ -2713,55 +2789,234 @@ class CoreAgentManager:
 
         return normalized, project_path
 
-    def get_project_loop(self, project: str) -> AgentLoop:
-        normalized, project_path = self._normalize_project(project)
-        registration = self._project_registry[normalized]
-        loop = self.project_loops.get(normalized)
-        if loop is None:
-            scope_lines = [f"Project scope: {normalized}"]
-            if registration.owner:
-                scope_lines.append(f"Owner: {registration.owner}")
-            if registration.description:
-                scope_lines.append(f"Description: {registration.description}")
-            if registration.prompt_hint:
-                scope_lines.append(f"Prompt hint: {registration.prompt_hint}")
-            loop = AgentLoop(
-                bus=self.bus,
-                provider=self.provider,
-                workspace=project_path,
-                model=self.model,
-                max_iterations=self.max_iterations,
-                brave_api_key=self.brave_api_key,
-                exec_config=self.exec_config,
-                restrict_to_workspace=self.restrict_to_workspace,
-                session_manager=self.sessions,
-                agent_role="project",
-                scope_hint="\n".join(scope_lines),
-                enable_message_tool=False,
-            )
-            loop.tools.register(
-                ManageWorkflowStateTool(
-                    self,
-                    allowed_entities=["work_item", "contract", "dependency_edge", "decision"],
-                    allowed_actions=["create", "get", "list", "update"],
-                    actor_role=f"project:{normalized}",
-                )
-            )
-            loop.tools.register(DescribeProviderInterfacesTool(self))
-            loop.tools.register(RegisterContractFunctionDependencyTool(self))
-            self.project_loops[normalized] = loop
-        return loop
+    async def _ensure_project_subprocess(self, project: str) -> ProjectSubprocessHandle:
+        """Start (or return existing) persistent subprocess for a project."""
+        normalized, _ = self._normalize_project(project)
+        existing = self._project_subprocesses.get(normalized)
+        if existing is not None and existing.process.returncode is None:
+            return existing
 
-    async def delegate_project_task(
+        registration = self._project_registry[normalized]
+        scope_lines = [f"Project scope: {normalized}"]
+        if registration.owner:
+            scope_lines.append(f"Owner: {registration.owner}")
+        if registration.description:
+            scope_lines.append(f"Description: {registration.description}")
+        if registration.prompt_hint:
+            scope_lines.append(f"Prompt hint: {registration.prompt_hint}")
+        scope_hint = "\n".join(scope_lines)
+
+        # Find the worker module path relative to the venv / python path
+        worker_module = "nanobot.agent.project_worker"
+        python_exe = self._find_python_executable()
+
+        cmd = [
+            python_exe,
+            "-m", worker_module,
+            "--config-path", str(self._config_path or ""),
+            "--workspace", str(self.workspace),
+            "--project", normalized,
+            "--scope-hint", scope_hint,
+            "--provider-type", self._worker_provider_type,
+        ]
+
+        logger = __import__("loguru").logger
+        logger.info("Starting project subprocess for {}: {}", normalized, " ".join(cmd))
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=1024 * 1024,  # 1MB buffer
+        )
+
+        from datetime import timezone
+        handle = ProjectSubprocessHandle(
+            project=normalized,
+            process=process,
+            pid=process.pid or 0,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            scope_hint=scope_hint,
+        )
+        self._project_subprocesses[normalized] = handle
+
+        handle.reader_task = asyncio.create_task(self._read_subprocess_stdout(handle))
+
+        # Start background stderr logger
+        asyncio.create_task(self._pipe_subprocess_stderr(normalized, process))
+
+        # Also keep in old project_loops dict for backward compatibility
+        self.project_loops[normalized] = None  # placeholder
+
+        return handle
+
+    @staticmethod
+    def _find_python_executable() -> str:
+        """Find the Python executable to use for subprocess workers."""
+        import sys
+        return sys.executable
+
+    async def _pipe_subprocess_stderr(self, project: str, process: asyncio.subprocess.Process) -> None:
+        """Read and log subprocess stderr in the background."""
+        logger = __import__("loguru").logger
+        try:
+            while True:
+                line = await process.stderr.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    logger.info("[project:{}] {}", project, text)
+        except Exception:
+            pass
+
+    async def _read_subprocess_stdout(self, handle: ProjectSubprocessHandle) -> None:
+        """Continuously read completion messages from one project subprocess."""
+        logger = __import__("loguru").logger
+        process = handle.process
+        try:
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    response = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    logger.warning("Ignoring invalid project subprocess JSON for {}: {}", handle.project, exc)
+                    continue
+
+                request_id = str(response.get("id") or "").strip()
+                request_state = handle.pending_requests.pop(request_id, None)
+                if request_state is None:
+                    logger.warning("Received orphan project subprocess response for {}: {}", handle.project, request_id)
+                    continue
+                await self._handle_project_subprocess_response(request_state, response)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Project subprocess reader failed for {}: {}", handle.project, exc)
+            await self._fail_pending_project_requests(handle, str(exc))
+            return
+
+        if handle.pending_requests and process.returncode is not None:
+            await self._fail_pending_project_requests(
+                handle,
+                f"Subprocess for {handle.project} exited with code {process.returncode}",
+            )
+
+    async def _handle_project_subprocess_response(
         self,
+        request_state: PendingProjectRequest,
+        response: dict[str, Any],
+    ) -> None:
+        """Resolve one queued project request and publish its completion notification."""
+        success = bool(response.get("success", False))
+        result_text = str(response.get("result") or "")
+        error_text = str(response.get("error") or "Unknown subprocess error")
+
+        future = request_state.future
+        if future is not None and not future.done():
+            if success:
+                future.set_result(response)
+            else:
+                future.set_exception(RuntimeError(error_text))
+
+        if success:
+            self._emit_workflow_event(
+                "workflow.project_agent.delegation.completed",
+                {
+                    "project": request_state.project,
+                    "session_key": request_state.session_key,
+                    "channel": request_state.channel,
+                    "chat_id": request_state.chat_id,
+                    "result_preview": result_text[:300],
+                    "request_id": request_state.request_id,
+                },
+            )
+        else:
+            self._emit_workflow_event(
+                "workflow.project_agent.delegation.failed",
+                {
+                    "project": request_state.project,
+                    "session_key": request_state.session_key,
+                    "channel": request_state.channel,
+                    "chat_id": request_state.chat_id,
+                    "error": error_text,
+                    "request_id": request_state.request_id,
+                },
+            )
+
+        if not request_state.publish_completion_message:
+            return
+
+        message_content = (
+            f"[Project Scope: {request_state.project}]\n{result_text}"
+            if success
+            else f"[Project Scope: {request_state.project}]\nError: {error_text}"
+        )
+        await self.bus.publish_inbound(
+            InboundMessage(
+                channel="system",
+                sender_id="project_agent_completion",
+                chat_id=f"{request_state.channel}:{request_state.chat_id}",
+                content=message_content,
+                metadata={
+                    "passthrough": True,
+                    "project": request_state.project,
+                    "request_id": request_state.request_id,
+                },
+            )
+        )
+
+    async def _fail_pending_project_requests(self, handle: ProjectSubprocessHandle, reason: str) -> None:
+        """Fail all queued requests when a subprocess dies or its reader collapses."""
+        pending = list(handle.pending_requests.values())
+        handle.pending_requests.clear()
+        for request_state in pending:
+            future = request_state.future
+            if future is not None and not future.done():
+                future.set_exception(RuntimeError(reason))
+            await self._handle_project_subprocess_response(
+                request_state,
+                {
+                    "id": request_state.request_id,
+                    "success": False,
+                    "error": reason,
+                },
+            )
+
+    async def _send_subprocess_request(
+        self,
+        handle: ProjectSubprocessHandle,
+        request: dict[str, Any],
+    ) -> None:
+        """Send a JSON request to a subprocess without waiting for the response."""
+        process = handle.process
+        if process.returncode is not None:
+            raise RuntimeError(f"Subprocess for {handle.project} exited with code {process.returncode}")
+
+        req_line = json.dumps(request, ensure_ascii=False) + "\n"
+        assert process.stdin is not None
+        process.stdin.write(req_line.encode("utf-8"))
+        await process.stdin.drain()
+
+    async def _submit_project_task(
+        self,
+        *,
         project: str,
         task: str,
         session_key: str,
         channel: str,
         chat_id: str,
-    ) -> str:
-        loop = self.get_project_loop(project)
+        publish_completion_message: bool,
+    ) -> PendingProjectRequest:
+        """Queue one project task in its subprocess and return a future resolved by the reader task."""
         normalized, _ = self._normalize_project(project)
+        handle = await self._ensure_project_subprocess(project)
         project_session = f"{session_key}::project::{normalized.replace('/', ':')}"
         runtime_attributes = dict(self._project_runtime_attributes.get(normalized, {}))
         delegated_task = task
@@ -2774,6 +3029,21 @@ class CoreAgentManager:
                 f"[Task]\n{task}"
             )
 
+        request_id = f"deleg-{normalized}-{self._next_subprocess_req_id}"
+        self._next_subprocess_req_id += 1
+        request_state = PendingProjectRequest(
+            request_id=request_id,
+            project=normalized,
+            channel=channel,
+            chat_id=chat_id,
+            session_key=project_session,
+            submitted_at=self._now_iso(),
+            task_preview=task[:200],
+            publish_completion_message=publish_completion_message,
+            future=asyncio.get_running_loop().create_future(),
+        )
+        handle.pending_requests[request_id] = request_state
+
         self._emit_workflow_event(
             "workflow.project_agent.delegation.started",
             {
@@ -2783,29 +3053,26 @@ class CoreAgentManager:
                 "chat_id": chat_id,
                 "has_runtime_attributes": bool(runtime_attributes),
                 "task_preview": task[:200],
+                "request_id": request_id,
             },
         )
 
         try:
-            result = await loop.process_direct(
-                delegated_task,
-                session_key=project_session,
-                channel=channel,
-                chat_id=chat_id,
-            )
-            self._emit_workflow_event(
-                "workflow.project_agent.delegation.completed",
+            await self._send_subprocess_request(
+                handle,
                 {
-                    "project": normalized,
+                    "id": request_id,
+                    "task": delegated_task,
                     "session_key": project_session,
                     "channel": channel,
                     "chat_id": chat_id,
-                    "has_runtime_attributes": bool(runtime_attributes),
-                    "result_preview": result[:300],
                 },
             )
-            return f"[Project Scope: {normalized}]\n{result}"
         except Exception as exc:
+            handle.pending_requests.pop(request_id, None)
+            future = request_state.future
+            if future is not None and not future.done():
+                future.set_exception(exc)
             self._emit_workflow_event(
                 "workflow.project_agent.delegation.failed",
                 {
@@ -2813,11 +3080,34 @@ class CoreAgentManager:
                     "session_key": project_session,
                     "channel": channel,
                     "chat_id": chat_id,
-                    "has_runtime_attributes": bool(runtime_attributes),
                     "error": str(exc),
+                    "request_id": request_id,
                 },
             )
             raise
+
+        return request_state
+
+    async def delegate_project_task(
+        self,
+        project: str,
+        task: str,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+    ) -> str:
+        request_state = await self._submit_project_task(
+            project=project,
+            task=task,
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            publish_completion_message=True,
+        )
+        return (
+            f"Queued task for project scope '{request_state.project}' asynchronously "
+            f"(request_id={request_state.request_id}). A completion message will be sent when it finishes."
+        )
 
     async def delegate_projects_batch(
         self,
@@ -2880,14 +3170,17 @@ class CoreAgentManager:
                 raise ValueError("Each batch item must include non-empty 'project' and 'task'")
 
             batch_session = f"{session_key}::batch::{index}"
-            result = await self.delegate_project_task(
+            request_state = await self._submit_project_task(
                 project=project,
                 task=task,
                 session_key=batch_session,
                 channel=channel,
                 chat_id=chat_id,
+                publish_completion_message=False,
             )
-            return index, project, result
+            response = await asyncio.wait_for(request_state.future, timeout=1200.0)
+            result = f"[Project Scope: {request_state.project}]\n{str(response.get('result') or '')}"
+            return index, request_state.project, result
 
         results = await asyncio.gather(
             *[_delegate(index, item) for index, item in enumerate(items, start=1)],
@@ -2988,9 +3281,10 @@ class CoreAgentManager:
             await self.core_loop.run()
         finally:
             await self._stop_reconciler()
+            await self._shutdown_project_subprocesses()
 
     def stop(self) -> None:
-        """Stop the core loop."""
+        """Stop the core loop and terminate all project subprocesses."""
         if self._reconciler_task is not None:
             self._reconciler_task.cancel()
             self._reconciler_task = None
