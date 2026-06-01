@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from numpy import random
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +183,9 @@ async def _run_worker_loop(
 
     try:
         while True:
+            # wait random seconds to simulate variable processing time and increase chance of concurrent messages in tests (from 10s to 20s)
+            await asyncio.sleep(random.uniform(10, 20))
+
             line = await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
             if not line:
                 logger.info("Project worker received EOF, shutting down")
