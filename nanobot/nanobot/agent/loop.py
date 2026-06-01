@@ -156,6 +156,7 @@ class AgentLoop:
                     self.bus.consume_inbound(),
                     timeout=1.0
                 )
+                # 可能有project worker的消息在处理工具调用时发送过来
 
                 # Process it
                 try:

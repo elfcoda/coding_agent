@@ -5,7 +5,4 @@ def existing_module2_value() -> str:
     return "module2"
 
 
-def get_module2_interface() -> str:
-    return "module2-interface"
-
 # ADD_INTERFACE_HERE
