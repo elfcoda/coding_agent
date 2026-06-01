@@ -171,5 +171,5 @@ demo阶段只做简单demo和核心模块，尽量别去整理edge case，只演
 2. 当scheduler循环扫描发现有contract的状态发生变化为完结
 3. 当某个work item被取消block状态导致依赖边变成inactive后
     系统运行：core manager启动后会在后台起一个扫描任务和不断更新状态的任务去触发，主进程则是不断loop接收用户的发来的消息，派发project  agent去形成work item，来持续输入持续生成decision给前端决策。
-    处理：edge case工程问题都会有，这里不管edge case，也先不管重构需求和其他需求，不管verify，只管核心工作流在mock llm后是否能跑通。前端管breakdown，监控，aspire（高熵提供灵感），附加attach，持续输入持续decision，多模态输入，接收msgs并decision的feature，复杂的由e2e处理，在demo期只做这些。
+    处理：edge case工程问题都会有，这里不管edge case，也先不管重构需求和其他需求，不管verify，只管核心工作流在mock llm后是否能跑通。前端管breakdown，监控，aspire（高熵提供灵感），附加attach，持续输入持续decision，多模态输入，展示block状态和verify动态绿色路径，接收msgs并decision的feature，复杂的由e2e处理，在demo期只做这些。
     最后：要能做demo，但是系统架构，状态流转，设计原理，核心流程要懂。其他的不用做，不用做完整，没人问。
