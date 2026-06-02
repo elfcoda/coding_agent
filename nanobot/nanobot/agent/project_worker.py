@@ -23,6 +23,8 @@ from typing import Any
 from loguru import logger
 from numpy import random
 
+from nanobot.bus.events import InboundMessage
+
 
 # ---------------------------------------------------------------------------
 # Scripted provider for testing (--provider-type scripted)
@@ -30,6 +32,8 @@ from numpy import random
 
 class _ScriptedProjectProvider:
     """A scripted LLM provider used in test mode that responds with edit_file tool calls."""
+
+    MOCK_NETWORK_DATA = "MOCK_NETWORK_DATA: module1-service-status=healthy"
 
     def __init__(self, repo_root: Path):
         self._repo_root = repo_root.resolve()
@@ -47,11 +51,76 @@ class _ScriptedProjectProvider:
         }
         tool_messages = [msg for msg in messages if msg.get("role") == "tool"]
 
+        workspace = self._extract_workspace(messages)
+        module_name = workspace.name
+        latest_user_message = self._extract_latest_user_message(messages)
+        is_subagent_prompt = self._is_subagent_prompt(messages)
+        has_mock_network_data = self.MOCK_NETWORK_DATA in latest_user_message
+
+        if is_subagent_prompt:
+            if module_name == "module1" and "mock_network_fetch" in tool_names:
+                if not any(msg.get("name") == "mock_network_fetch" for msg in tool_messages):
+                    return LLMResponse(
+                        content="Fetching mocked module1 network data.",
+                        tool_calls=[
+                            ToolCallRequest(
+                                id="module1-mock-network-fetch",
+                                name="mock_network_fetch",
+                                arguments={"resource": "module1-service-status"},
+                            )
+                        ],
+                    )
+                return LLMResponse(content=self.MOCK_NETWORK_DATA)
+            return LLMResponse(content=f"No mocked network data required for {module_name}.")
+
+        if module_name == "module1" and "spawn" in tool_names and not has_mock_network_data:
+            if not any(msg.get("name") == "spawn" for msg in tool_messages):
+                return LLMResponse(
+                    content="Spawning a helper to fetch mocked module1 network data.",
+                    tool_calls=[
+                        ToolCallRequest(
+                            id="module1-network-probe",
+                            name="spawn",
+                            arguments={
+                                "task": "Fetch mocked network data for module1 and return only the network status line.",
+                                "label": "module1 network probe",
+                            },
+                        )
+                    ],
+                )
+            return LLMResponse(content="Waiting for mocked network data before editing module1 api.py.")
+
         if "edit_file" in tool_names:
-            workspace = self._extract_workspace(messages)
-            module_name = workspace.name
             if any(msg.get("name") == "edit_file" for msg in tool_messages):
+                if module_name == "module1" and has_mock_network_data:
+                    return LLMResponse(
+                        content=(
+                            f"Updated {module_name} api.py with a simple interface and {self.MOCK_NETWORK_DATA}."
+                        )
+                    )
                 return LLMResponse(content=f"Updated {module_name} api.py with a simple interface.")
+
+            if module_name == "module1" and has_mock_network_data:
+                return LLMResponse(
+                    content=f"Editing {module_name} api.py with mocked network data.",
+                    tool_calls=[
+                        ToolCallRequest(
+                            id=f"project-{module_name}",
+                            name="edit_file",
+                            arguments={
+                                "path": str(workspace / "api.py"),
+                                "old_text": "# ADD_INTERFACE_HERE",
+                                "new_text": (
+                                    f"def get_{module_name}_interface() -> str:\n"
+                                    f"    return \"{module_name}-interface\"\n\n"
+                                    f"# {self.MOCK_NETWORK_DATA}\n"
+                                    "# ADD_INTERFACE_HERE"
+                                ),
+                            },
+                        )
+                    ],
+                )
+
             return LLMResponse(
                 content=f"Editing {module_name} api.py.",
                 tool_calls=[
@@ -80,6 +149,18 @@ class _ScriptedProjectProvider:
         if not match:
             raise AssertionError("Workspace path not found in system prompt")
         return Path(match.group(1).strip())
+
+    @staticmethod
+    def _extract_latest_user_message(messages: list[dict]) -> str:
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                return str(message.get("content") or "")
+        return ""
+
+    @staticmethod
+    def _is_subagent_prompt(messages: list[dict]) -> bool:
+        system_content = str(messages[0].get("content") or "")
+        return system_content.lstrip().startswith("# Subagent")
 
 
 # ---------------------------------------------------------------------------
@@ -147,16 +228,25 @@ async def _process_single_request(
     """Process one delegation request through the agent loop."""
     req_id = request.get("id", "unknown")
     task = request.get("task", "")
-    channel = request.get("channel", "cli")
-    chat_id = request.get("chat_id", "direct")
     session_key = request.get("session_key", f"project_worker:{req_id}")
+    local_channel = "project_worker"
+    local_chat_id = str(req_id)
 
     try:
-        result = await loop.process_direct(
-            content=task,
-            session_key=session_key,
-            channel=channel,
-            chat_id=chat_id,
+        await loop.bus.publish_inbound(
+            InboundMessage(
+                channel=local_channel,
+                sender_id="user",
+                chat_id=local_chat_id,
+                content=task,
+                session_key_override=session_key,
+            )
+        )
+
+        result = await _collect_request_result(
+            loop,
+            channel=local_channel,
+            chat_id=local_chat_id,
         )
         return {"id": req_id, "success": True, "result": result}
     except asyncio.CancelledError:
@@ -164,6 +254,47 @@ async def _process_single_request(
     except Exception as exc:
         logger.error("Project worker task failed: {}", exc)
         return {"id": req_id, "success": False, "error": str(exc)}
+
+
+async def _collect_request_result(
+    loop: Any,
+    *,
+    channel: str,
+    chat_id: str,
+    overall_timeout: float = 60.0,
+    quiet_period: float = 2.0,
+) -> str:
+    """Collect the latest outbound message for a request, allowing follow-up subagent results to arrive."""
+    event_loop = asyncio.get_running_loop()
+    deadline = event_loop.time() + overall_timeout
+    latest_content: str | None = None
+
+    while event_loop.time() < deadline:
+        message = await asyncio.wait_for(
+            loop.bus.consume_outbound(),
+            timeout=max(0.1, deadline - event_loop.time()),
+        )
+        if message.channel != channel or message.chat_id != chat_id:
+            continue
+
+        latest_content = message.content
+        quiet_deadline = min(deadline, event_loop.time() + quiet_period)
+        while event_loop.time() < quiet_deadline:
+            try:
+                next_message = await asyncio.wait_for(
+                    loop.bus.consume_outbound(),
+                    timeout=max(0.1, quiet_deadline - event_loop.time()),
+                )
+            except asyncio.TimeoutError:
+                return latest_content
+
+            if next_message.channel == channel and next_message.chat_id == chat_id:
+                latest_content = next_message.content
+                quiet_deadline = min(deadline, event_loop.time() + quiet_period)
+
+        return latest_content
+
+    raise TimeoutError(f"Timed out waiting for project worker response on {channel}:{chat_id}")
 
 
 async def _run_worker_loop(
@@ -174,6 +305,7 @@ async def _run_worker_loop(
 ) -> None:
     """Main worker loop: read requests from stdin, process, write responses to stdout."""
     loop = _create_agent_loop(project_path, config_path, scope_hint, provider_type=provider_type)
+    loop_task = asyncio.create_task(loop.run())
     logger.info(
         "Project worker ready for {} (scope: {}, provider: {})",
         project_path, scope_hint or "none", provider_type,
@@ -206,6 +338,7 @@ async def _run_worker_loop(
             writer.flush()
     finally:
         loop.stop()
+        await asyncio.gather(loop_task, return_exceptions=True)
 
 
 def main() -> None:

@@ -175,6 +175,7 @@ async def test_core_manager_run_e2e_delegates_fixed_test_code_projects(tmp_path:
         await asyncio.sleep(3)
 
         logger.info("\x1b[32m Publishing test message to trigger delegation... \x1b[0m")
+        # core manager的入口其实可以并行，project agent处理具体的目录，并行的话可能会有冲突
         await bus.publish_inbound(
             InboundMessage(
                 channel="e2e",
@@ -209,6 +210,7 @@ async def test_core_manager_run_e2e_delegates_fixed_test_code_projects(tmp_path:
         assert "[Project Scope: test_code/module1]" in completion_content
         assert "[Project Scope: test_code/module2]" in completion_content
         assert "[Project Scope: test_code/module3]" in completion_content
+        assert "MOCK_NETWORK_DATA: module1-service-status=healthy" in completion_content
 
         await asyncio.sleep(1)  # wait for the delegated file edits to be flushed
 
@@ -216,6 +218,9 @@ async def test_core_manager_run_e2e_delegates_fixed_test_code_projects(tmp_path:
             content = path.read_text(encoding="utf-8")
             assert f"def get_{module_name}_interface() -> str:" in content
             assert f'return "{module_name}-interface"' in content
+
+        module1_content = test_files["module1"].read_text(encoding="utf-8")
+        assert "# MOCK_NETWORK_DATA: module1-service-status=healthy" in module1_content
     except Exception as e:
         logger.error("\x1b[31m Test failed with exception: %s \x1b[0m", e)
         assert False, f"Test failed with exception: {e}"

@@ -481,8 +481,9 @@ class AgentLoop:
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
 
+        session_key = msg.session_key_override or f"{origin_channel}:{origin_chat_id}"
+
         if bool((msg.metadata or {}).get("passthrough")):
-            session_key = f"{origin_channel}:{origin_chat_id}"
             session = self.sessions.get_or_create(session_key)
             session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
             session.add_message("assistant", msg.content)
@@ -495,7 +496,6 @@ class AgentLoop:
             )
 
         # Use the origin session for context
-        session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
 
         # Update tool contexts
