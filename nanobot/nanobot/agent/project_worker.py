@@ -435,7 +435,7 @@ async def _collect_request_result(
     *,
     channel: str,
     chat_id: str,
-    overall_timeout: float = 60.0,
+    overall_timeout: float = 600.0,
     quiet_period: float = 2.0,
 ) -> str:
     """Collect the latest outbound message for a request, allowing follow-up subagent results to arrive."""
@@ -522,7 +522,7 @@ async def _run_worker_loop(
             if request is None:
                 break
 
-            # wait random seconds to simulate variable processing time and increase chance of concurrent messages in tests (from 10s to 20s)
+            # wait random seconds to simulate variable processing time and increase chance of concurrent messages in tests (from 3s to 5s)
             await asyncio.sleep(random.uniform(3, 5))
 
             response = await _process_single_request(loop, decision_bridge, request)
