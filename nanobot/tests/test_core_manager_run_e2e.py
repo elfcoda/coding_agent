@@ -30,8 +30,27 @@ class ScriptedDelegationProvider(LLMProvider):
             if isinstance(item, dict)
         }
         tool_messages = [msg for msg in messages if msg.get("role") == "tool"]
+        latest_user_message = self._extract_latest_user_message(messages).lower()
 
         if "delegate_project_task" in tool_names:
+            if "decision" in latest_user_message:
+                if any(msg.get("name") == "delegate_project_task" for msg in tool_messages):
+                    return LLMResponse(
+                        content="Delegated module1 and waiting for a user decision before finishing the change.",
+                    )
+                return LLMResponse(
+                    content="Dispatching a decision-driven module1 project agent.",
+                    tool_calls=[
+                        ToolCallRequest(
+                            id="core-module1-decision",
+                            name="delegate_project_task",
+                            arguments={
+                                "project": "test_code/module1",
+                                "task": "Need user decision to choose the module1 interface style before editing api.py.",
+                            },
+                        ),
+                    ],
+                )
             if any(msg.get("name") == "delegate_project_task" for msg in tool_messages):
                 return LLMResponse(
                     content="Delegated simple interface updates to module1, module2, and module3.",
@@ -100,6 +119,13 @@ class ScriptedDelegationProvider(LLMProvider):
             raise AssertionError("Workspace path not found in system prompt")
         return Path(match.group(1).strip())
 
+    @staticmethod
+    def _extract_latest_user_message(messages: list[dict]) -> str:
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                return str(message.get("content") or "")
+        return ""
+
 
 async def _wait_for(predicate, *, timeout: float = 5.0) -> None:
     loop = asyncio.get_running_loop()
@@ -139,6 +165,21 @@ async def _consume_many_responses(
     if len(messages) != count:
         raise AssertionError(f"Timed out waiting for {count} outbound messages; got {len(messages)}")
     return messages
+
+
+async def _consume_matching_response(
+    bus: MessageBus,
+    *,
+    predicate,
+    timeout: float = 120.0,
+) -> OutboundMessage:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        message = await asyncio.wait_for(bus.consume_outbound(), timeout=max(0.1, deadline - loop.time()))
+        if predicate(message):
+            return message
+    raise AssertionError("Timed out waiting for the requested matching outbound message")
 
 
 async def test_core_manager_run_e2e_delegates_fixed_test_code_projects(tmp_path: Path) -> None:
@@ -229,5 +270,88 @@ async def test_core_manager_run_e2e_delegates_fixed_test_code_projects(tmp_path:
         for module_name, path in test_files.items():
             if module_name in original_contents:
                 path.write_text(original_contents[module_name], encoding="utf-8")
+        manager.stop()
+        await asyncio.wait_for(manager_task, timeout=5.0)
+
+
+async def test_core_manager_run_e2e_project_agent_requests_user_decision(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    workflow_db = tmp_path / f"workflow_test_{uuid.uuid4().hex}.db"
+    workflow_store = WorkflowStore(workflow_db)
+    bus = MessageBus()
+    provider = ScriptedDelegationProvider(repo_root)
+    manager = CoreAgentManager(
+        bus=bus,
+        provider=provider,
+        workspace=repo_root,
+        allowed_project_scopes=["test_code/module1"],
+        workflow_store=workflow_store,
+        decision_sla_seconds=3600,
+        decision_sla_block_scope="module",
+        decision_queue_impact_weight=10,
+        decision_queue_age_weight=1,
+        decision_default_degradation="wait",
+    )
+    manager._worker_provider_type = "scripted"
+
+    test_file = repo_root / "test_code" / "module1" / "api.py"
+    original_content = test_file.read_text(encoding="utf-8")
+
+    manager_task = asyncio.create_task(manager.run())
+    try:
+        await asyncio.sleep(3)
+
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="e2e",
+                sender_id="tester",
+                chat_id="core-decision-flow",
+                content="Run a decision-driven module1 change and ask for a user decision if uncertain.",
+            )
+        )
+
+        initial_response = await _consume_response(bus, channel="e2e", chat_id="core-decision-flow")
+        assert "module1" in initial_response.content.lower()
+
+        decision_prompt = await _consume_matching_response(
+            bus,
+            predicate=lambda message: (
+                message.channel == "e2e"
+                and message.chat_id == "core-decision-flow"
+                and str(message.metadata.get("type") or "") == "project_agent_decision_request"
+            ),
+            timeout=60.0,
+        )
+        decision_id = str(decision_prompt.metadata.get("project_decision_id") or "")
+        assert decision_id
+        assert decision_prompt.metadata.get("project") == "test_code/module1"
+        assert decision_prompt.metadata.get("options") == ["rest", "graphql"]
+
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="e2e",
+                sender_id="tester",
+                chat_id="core-decision-flow",
+                content="rest",
+                metadata={"project_decision_id": decision_id},
+            )
+        )
+
+        completion = await _consume_matching_response(
+            bus,
+            predicate=lambda message: (
+                message.channel == "e2e"
+                and message.chat_id == "core-decision-flow"
+                and "USER_DECISION: rest" in message.content
+            ),
+            timeout=60.0,
+        )
+        assert "[Project Scope: test_code/module1]" in completion.content
+
+        await asyncio.sleep(1)
+        updated = test_file.read_text(encoding="utf-8")
+        assert "# USER_DECISION: rest" in updated
+    finally:
+        test_file.write_text(original_content, encoding="utf-8")
         manager.stop()
         await asyncio.wait_for(manager_task, timeout=5.0)

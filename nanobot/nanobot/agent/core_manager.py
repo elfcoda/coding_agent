@@ -79,6 +79,20 @@ class PendingProjectRequest:
     future: asyncio.Future[dict[str, Any]] | None = None
 
 
+@dataclass
+class PendingProjectDecision:
+    """A decision requested by a project subprocess and waiting for a user reply."""
+
+    decision_id: str
+    request_id: str
+    project: str
+    channel: str
+    chat_id: str
+    session_key: str
+    prompt: str
+    options: list[str] = field(default_factory=list)
+
+
 class CoreAgentManager:
     """Coordinate a core agent and project-scoped agent subprocesses."""
 
@@ -123,6 +137,7 @@ class CoreAgentManager:
         self.workflow_store = workflow_store or WorkflowStore(get_data_dir() / "workflow" / "state.db")
         self.project_loops: dict[str, AgentLoop] = {}
         self._project_subprocesses: dict[str, ProjectSubprocessHandle] = {}
+        self._pending_project_decisions: dict[str, PendingProjectDecision] = {}
         self._next_subprocess_req_id: int = 0
         self._config_path: str | None = None
         self._worker_provider_type: str = "litellm"  # "litellm" or "scripted"
@@ -2889,7 +2904,16 @@ class CoreAgentManager:
                     logger.warning("Ignoring invalid project subprocess JSON for {}: {}", handle.project, exc)
                     continue
 
+                response_type = str(response.get("type") or "").strip().lower()
                 request_id = str(response.get("id") or "").strip()
+                if response_type == "decision_request":
+                    request_state = handle.pending_requests.get(request_id)
+                    if request_state is None:
+                        logger.warning("Received orphan project decision request for {}: {}", handle.project, request_id)
+                        continue
+                    await self._handle_project_subprocess_decision_request(request_state, response)
+                    continue
+
                 request_state = handle.pending_requests.pop(request_id, None)
                 if request_state is None:
                     logger.warning("Received orphan project subprocess response for {}: {}", handle.project, request_id)
@@ -2914,6 +2938,7 @@ class CoreAgentManager:
         response: dict[str, Any],
     ) -> None:
         """Resolve one queued project request and publish its completion notification."""
+        self._clear_pending_project_decisions_for_request(request_state.request_id)
         success = bool(response.get("success", False))
         result_text = str(response.get("result") or "")
         error_text = str(response.get("error") or "Unknown subprocess error")
@@ -2971,6 +2996,72 @@ class CoreAgentManager:
                 },
             )
         )
+
+    async def _handle_project_subprocess_decision_request(
+        self,
+        request_state: PendingProjectRequest,
+        response: dict[str, Any],
+    ) -> None:
+        """Forward a project-agent decision request to the frontend and keep the task pending."""
+        decision_id = str(response.get("decision_id") or "").strip()
+        if not decision_id:
+            raise RuntimeError(f"Project subprocess decision request missing decision_id for {request_state.project}")
+
+        prompt = str(response.get("prompt") or "").strip()
+        options = [str(item) for item in (response.get("options") or []) if str(item).strip()]
+        self._pending_project_decisions[decision_id] = PendingProjectDecision(
+            decision_id=decision_id,
+            request_id=request_state.request_id,
+            project=request_state.project,
+            channel=request_state.channel,
+            chat_id=request_state.chat_id,
+            session_key=request_state.session_key,
+            prompt=prompt,
+            options=options,
+        )
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=request_state.channel,
+                chat_id=request_state.chat_id,
+                content=f"[Project Scope: {request_state.project}]\nDecision required: {prompt}",
+                metadata={
+                    "type": "project_agent_decision_request",
+                    "project_decision_id": decision_id,
+                    "project": request_state.project,
+                    "request_id": request_state.request_id,
+                    "options": options,
+                },
+            )
+        )
+
+    def _clear_pending_project_decisions_for_request(self, request_id: str) -> None:
+        stale_ids = [decision_id for decision_id, state in self._pending_project_decisions.items() if state.request_id == request_id]
+        for decision_id in stale_ids:
+            self._pending_project_decisions.pop(decision_id, None)
+
+    async def _maybe_handle_project_decision_reply(self, msg: InboundMessage) -> bool:
+        """Route a frontend decision reply back to the waiting project subprocess."""
+        decision_id = str((msg.metadata or {}).get("project_decision_id") or "").strip()
+        if not decision_id:
+            return False
+
+        decision_state = self._pending_project_decisions.pop(decision_id, None)
+        if decision_state is None:
+            return False
+
+        handle = self._project_subprocesses.get(decision_state.project)
+        if handle is None:
+            raise RuntimeError(f"Project subprocess not found for pending decision {decision_id}")
+
+        await self._send_subprocess_request(
+            handle,
+            {
+                "type": "decision_response",
+                "decision_id": decision_id,
+                "content": msg.content,
+            },
+        )
+        return True
 
     async def _fail_pending_project_requests(self, handle: ProjectSubprocessHandle, reason: str) -> None:
         """Fail all queued requests when a subprocess dies or its reader collapses."""
@@ -3276,9 +3367,34 @@ class CoreAgentManager:
 
     async def run(self) -> None:
         """Run the core agent loop against the shared message bus."""
+        logger = __import__("loguru").logger
         await self._start_reconciler()
+        self.core_loop._running = True
+        logger.info("Agent loop started")
         try:
-            await self.core_loop.run()
+            while self.core_loop._running:
+                try:
+                    msg = await asyncio.wait_for(
+                        self.bus.consume_inbound(),
+                        timeout=1.0,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                if await self._maybe_handle_project_decision_reply(msg):
+                    continue
+
+                try:
+                    response = await self.core_loop._process_message(msg)
+                    if response:
+                        await self.bus.publish_outbound(response)
+                except Exception as e:
+                    logger.error(f"Error processing message: {e}")
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=f"Sorry, I encountered an error: {str(e)}"
+                    ))
         finally:
             await self._stop_reconciler()
             await self._shutdown_project_subprocesses()

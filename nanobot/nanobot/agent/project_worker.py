@@ -17,12 +17,15 @@ import asyncio
 import json
 import re
 import sys
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 from numpy import random
 
+from nanobot.agent.tools.base import Tool
 from nanobot.bus.events import InboundMessage
 
 
@@ -56,6 +59,51 @@ class _ScriptedProjectProvider:
         latest_user_message = self._extract_latest_user_message(messages)
         is_subagent_prompt = self._is_subagent_prompt(messages)
         has_mock_network_data = self.MOCK_NETWORK_DATA in latest_user_message
+        decision_choice = self._extract_tool_result(tool_messages, "request_user_decision")
+
+        if (
+            module_name == "module1"
+            and "need user decision" in latest_user_message.lower()
+            and "request_user_decision" in tool_names
+        ):
+            if decision_choice is None and not any(msg.get("name") == "request_user_decision" for msg in tool_messages):
+                return LLMResponse(
+                    content="Need a user decision before editing module1 api.py.",
+                    tool_calls=[
+                        ToolCallRequest(
+                            id="module1-user-decision",
+                            name="request_user_decision",
+                            arguments={
+                                "prompt": "Choose the module1 interface style.",
+                                "options": ["rest", "graphql"],
+                            },
+                        )
+                    ],
+                )
+            if decision_choice and "edit_file" in tool_names:
+                if any(msg.get("name") == "edit_file" for msg in tool_messages):
+                    return LLMResponse(
+                        content=f"Updated {module_name} api.py with USER_DECISION: {decision_choice}."
+                    )
+                return LLMResponse(
+                    content=f"Editing {module_name} api.py with the user decision.",
+                    tool_calls=[
+                        ToolCallRequest(
+                            id=f"project-{module_name}-decision",
+                            name="edit_file",
+                            arguments={
+                                "path": str(workspace / "api.py"),
+                                "old_text": "# ADD_INTERFACE_HERE",
+                                "new_text": (
+                                    f"def get_{module_name}_interface() -> str:\n"
+                                    f"    return \"{module_name}-{decision_choice}-interface\"\n\n"
+                                    f"# USER_DECISION: {decision_choice}\n"
+                                    "# ADD_INTERFACE_HERE"
+                                ),
+                            },
+                        )
+                    ],
+                )
 
         if is_subagent_prompt:
             if module_name == "module1" and "mock_network_fetch" in tool_names:
@@ -162,6 +210,120 @@ class _ScriptedProjectProvider:
         system_content = str(messages[0].get("content") or "")
         return system_content.lstrip().startswith("# Subagent")
 
+    @staticmethod
+    def _extract_tool_result(tool_messages: list[dict], tool_name: str) -> str | None:
+        for message in reversed(tool_messages):
+            if message.get("name") == tool_name:
+                return str(message.get("content") or "")
+        return None
+
+
+@dataclass
+class _ActiveRequestContext:
+    request_id: str
+    origin_channel: str
+    origin_chat_id: str
+    origin_session_key: str
+
+
+class _ProjectDecisionBridge:
+    """Bridge project-agent decision requests to the parent core manager."""
+
+    def __init__(self, project: str, writer: Any):
+        self._project = project
+        self._writer = writer
+        self._write_lock = asyncio.Lock()
+        self._pending: dict[str, asyncio.Future[str]] = {}
+        self._active_request: _ActiveRequestContext | None = None
+
+    def activate_request(self, context: _ActiveRequestContext | None) -> None:
+        self._active_request = context
+
+    async def request_decision(self, prompt: str, options: list[str] | None = None) -> str:
+        context = self._active_request
+        if context is None:
+            raise RuntimeError("No active project request is available for user decision")
+
+        decision_id = f"{context.request_id}:decision:{uuid.uuid4().hex[:8]}"
+        future = asyncio.get_running_loop().create_future()
+        self._pending[decision_id] = future
+        await self._write_json(
+            {
+                "type": "decision_request",
+                "id": context.request_id,
+                "decision_id": decision_id,
+                "project": self._project,
+                "channel": context.origin_channel,
+                "chat_id": context.origin_chat_id,
+                "session_key": context.origin_session_key,
+                "prompt": prompt,
+                "options": list(options or []),
+            }
+        )
+        try:
+            return await future
+        finally:
+            self._pending.pop(decision_id, None)
+
+    def resolve_decision(self, payload: dict[str, Any]) -> bool:
+        decision_id = str(payload.get("decision_id") or "").strip()
+        if not decision_id:
+            return False
+        future = self._pending.get(decision_id)
+        if future is None or future.done():
+            return False
+        answer = str(payload.get("content") or payload.get("decision") or "").strip()
+        future.set_result(answer)
+        return True
+
+    def fail_all(self, reason: str) -> None:
+        for future in list(self._pending.values()):
+            if not future.done():
+                future.set_exception(RuntimeError(reason))
+        self._pending.clear()
+
+    async def _write_json(self, payload: dict[str, Any]) -> None:
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
+        async with self._write_lock:
+            self._writer.write(line)
+            self._writer.flush()
+
+
+class _RequestUserDecisionTool(Tool):
+    """Request a user decision through the parent core manager and wait for the reply."""
+
+    def __init__(self, bridge: _ProjectDecisionBridge):
+        self._bridge = bridge
+
+    @property
+    def name(self) -> str:
+        return "request_user_decision"
+
+    @property
+    def description(self) -> str:
+        return "Ask the user for a decision when the project agent is uncertain and wait for the reply."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Question to send to the user",
+                },
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of candidate answers",
+                },
+            },
+            "required": ["prompt"],
+        }
+
+    async def execute(self, prompt: str, options: list[str] | None = None, **kwargs: Any) -> str:
+        return await self._bridge.request_decision(prompt=prompt, options=options)
+
 
 # ---------------------------------------------------------------------------
 # Real provider: load from nanobot config
@@ -223,6 +385,7 @@ def _create_agent_loop(
 
 async def _process_single_request(
     loop: Any,
+    decision_bridge: _ProjectDecisionBridge,
     request: dict[str, Any],
 ) -> dict[str, Any]:
     """Process one delegation request through the agent loop."""
@@ -231,6 +394,14 @@ async def _process_single_request(
     session_key = request.get("session_key", f"project_worker:{req_id}")
     local_channel = "project_worker"
     local_chat_id = str(req_id)
+    decision_bridge.activate_request(
+        _ActiveRequestContext(
+            request_id=req_id,
+            origin_channel=str(request.get("channel") or "cli"),
+            origin_chat_id=str(request.get("chat_id") or "direct"),
+            origin_session_key=session_key,
+        )
+    )
 
     try:
         await loop.bus.publish_inbound(
@@ -255,6 +426,8 @@ async def _process_single_request(
     except Exception as exc:
         logger.error("Project worker task failed: {}", exc)
         return {"id": req_id, "success": False, "error": str(exc)}
+    finally:
+        decision_bridge.activate_request(None)
 
 
 async def _collect_request_result(
@@ -306,40 +479,60 @@ async def _run_worker_loop(
 ) -> None:
     """Main worker loop: read requests from stdin, process, write responses to stdout."""
     loop = _create_agent_loop(project_path, config_path, scope_hint, provider_type=provider_type)
+    writer = sys.stdout
+    request_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    decision_bridge = _ProjectDecisionBridge(project=project_path.relative_to(project_path.parents[1]).as_posix(), writer=writer)
+    loop.tools.register(_RequestUserDecisionTool(decision_bridge))
     loop_task = asyncio.create_task(loop.run())
     logger.info(
         "Project worker ready for {} (scope: {}, provider: {})",
         project_path, scope_hint or "none", provider_type,
     )
 
-    writer = sys.stdout
-
-    try:
+    async def _read_stdin_forever() -> None:
         while True:
-            # wait random seconds to simulate variable processing time and increase chance of concurrent messages in tests (from 10s to 20s)
-            await asyncio.sleep(random.uniform(10, 20))
-
             line = await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
             if not line:
+                await request_queue.put(None)
                 logger.info("Project worker received EOF, shutting down")
-                break
+                return
 
             line = line.strip()
             if not line:
                 continue
 
             try:
-                request = json.loads(line)
+                payload = json.loads(line)
             except json.JSONDecodeError as e:
                 logger.error("Invalid JSON from stdin: {}", e)
                 continue
 
-            response = await _process_single_request(loop, request)
+            if str(payload.get("type") or "") == "decision_response":
+                if not decision_bridge.resolve_decision(payload):
+                    logger.warning("Ignoring orphan decision response for {}", payload.get("decision_id"))
+                continue
+
+            await request_queue.put(payload)
+
+    reader_task = asyncio.create_task(_read_stdin_forever())
+
+    try:
+        while True:
+            request = await request_queue.get()
+            if request is None:
+                break
+
+            # wait random seconds to simulate variable processing time and increase chance of concurrent messages in tests (from 10s to 20s)
+            await asyncio.sleep(random.uniform(3, 5))
+
+            response = await _process_single_request(loop, decision_bridge, request)
             writer.write(json.dumps(response, ensure_ascii=False) + "\n")
             writer.flush()
     finally:
+        reader_task.cancel()
+        decision_bridge.fail_all("Project worker shutting down")
         loop.stop()
-        await asyncio.gather(loop_task, return_exceptions=True)
+        await asyncio.gather(loop_task, reader_task, return_exceptions=True)
 
 
 def main() -> None:
