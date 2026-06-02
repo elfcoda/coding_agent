@@ -18,6 +18,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
+from nanobot.agent.tools.request_user_decision import RequestUserDecisionTool
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ExecToolConfig
@@ -73,6 +74,7 @@ class SubagentManager:
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        request_decision_callback: Any = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.provider = provider
@@ -82,9 +84,15 @@ class SubagentManager:
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self._request_decision_callback = request_decision_callback
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
 
     def _build_tool_registry(self) -> ToolRegistry:
+        # 作为demo，subagent先不需要处理_RequestUserDecisionTool，只要project agent处理就行了。后续需要再：
+        # 给subagent加个_RequestUserDecisionTool 工具注册让其使用。
+        #  假设有这样一个流程，project agent处理某个single request的时候，先spawn一个后台的subagent 1去处理某些事情，
+        # 然后下一个tool是#sym:_RequestUserDecisionTool ，由于subagent 1也能use decision，以同样的方式和路径发送decision。
+        # 你需要完成以上需求，并处理subagent 1和project agent的兼容性
         tools = ToolRegistry()
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         tools.register(ReadFileTool(allowed_dir=allowed_dir))
@@ -98,6 +106,8 @@ class SubagentManager:
         tools.register(WebSearchTool(api_key=self.brave_api_key))
         tools.register(WebFetchTool())
         tools.register(MockNetworkFetchTool())
+        if self._request_decision_callback is not None:
+            tools.register(RequestUserDecisionTool(self._request_decision_callback))
         return tools
 
     async def spawn(

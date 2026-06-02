@@ -26,6 +26,7 @@ from loguru import logger
 from numpy import random
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.request_user_decision import RequestUserDecisionTool
 from nanobot.bus.events import InboundMessage
 
 
@@ -138,15 +139,62 @@ class _ScriptedProjectProvider:
                 )
             return LLMResponse(content="Waiting for mocked network data before editing module1 api.py.")
 
+        if "request_user_decision" in tool_names and "edit_file" in tool_names:
+            decision_choice = self._extract_tool_result(tool_messages, "request_user_decision")
+            if decision_choice is not None and not any(msg.get("name") == "edit_file" for msg in tool_messages):
+                return LLMResponse(
+                    content=f"Editing {module_name} api.py with the user decision.",
+                    tool_calls=[
+                        ToolCallRequest(
+                            id=f"project-{module_name}-decision",
+                            name="edit_file",
+                            arguments={
+                                "path": str(workspace / "api.py"),
+                                "old_text": "# ADD_INTERFACE_HERE",
+                                "new_text": (
+                                    f"def get_{module_name}_interface() -> str:\n"
+                                    f"    return \"{module_name}-{decision_choice}-interface\"\n\n"
+                                    f"# USER_DECISION: {decision_choice}\n"
+                                    "# ADD_INTERFACE_HERE"
+                                ),
+                            },
+                        )
+                    ],
+                )
+
+        if "request_user_decision" in tool_names and "edit_file" in tool_names:
+            if not any(msg.get("name") == "request_user_decision" for msg in tool_messages):
+                return LLMResponse(
+                    content=f"Need a user decision before editing {module_name} api.py.",
+                    tool_calls=[
+                        ToolCallRequest(
+                            id=f"{module_name}-user-decision",
+                            name="request_user_decision",
+                            arguments={
+                                "prompt": f"Choose the {module_name} interface style.",
+                                "options": ["rest", "graphql"],
+                            },
+                        )
+                    ],
+                )
+
         if "edit_file" in tool_names:
+            decision_text = ""
+            if "request_user_decision" in tool_names:
+                dc = self._extract_tool_result(tool_messages, "request_user_decision")
+                if dc:
+                    decision_text = f" and USER_DECISION: {dc}"
             if any(msg.get("name") == "edit_file" for msg in tool_messages):
                 if module_name == "module1" and has_mock_network_data:
                     return LLMResponse(
                         content=(
-                            f"Updated {module_name} api.py with a simple interface and {self.MOCK_NETWORK_DATA}."
+                            f"Updated {module_name} api.py with a simple interface, "
+                            f"{self.MOCK_NETWORK_DATA}{decision_text}."
                         )
                     )
-                return LLMResponse(content=f"Updated {module_name} api.py with a simple interface.")
+                return LLMResponse(
+                    content=f"Updated {module_name} api.py with a simple interface{decision_text}."
+                )
 
             if module_name == "module1" and has_mock_network_data:
                 return LLMResponse(
@@ -289,40 +337,8 @@ class _ProjectDecisionBridge:
             self._writer.flush()
 
 
-class _RequestUserDecisionTool(Tool):
-    """Request a user decision through the parent core manager and wait for the reply."""
-
-    def __init__(self, bridge: _ProjectDecisionBridge):
-        self._bridge = bridge
-
-    @property
-    def name(self) -> str:
-        return "request_user_decision"
-
-    @property
-    def description(self) -> str:
-        return "Ask the user for a decision when the project agent is uncertain and wait for the reply."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "Question to send to the user",
-                },
-                "options": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional list of candidate answers",
-                },
-            },
-            "required": ["prompt"],
-        }
-
-    async def execute(self, prompt: str, options: list[str] | None = None, **kwargs: Any) -> str:
-        return await self._bridge.request_decision(prompt=prompt, options=options)
+class _RequestUserDecisionTool(RequestUserDecisionTool):
+    """Alias kept for back-compat; logic lives in the shared tool above."""
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +498,9 @@ async def _run_worker_loop(
     writer = sys.stdout
     request_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
     decision_bridge = _ProjectDecisionBridge(project=project_path.relative_to(project_path.parents[1]).as_posix(), writer=writer)
-    loop.tools.register(_RequestUserDecisionTool(decision_bridge))
+    loop.tools.register(RequestUserDecisionTool(decision_bridge.request_decision))
+    loop._request_decision_callback = decision_bridge.request_decision
+    loop.subagents._request_decision_callback = decision_bridge.request_decision
     loop_task = asyncio.create_task(loop.run())
     logger.info(
         "Project worker ready for {} (scope: {}, provider: {})",

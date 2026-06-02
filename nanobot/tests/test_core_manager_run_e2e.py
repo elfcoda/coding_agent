@@ -30,10 +30,12 @@ class ScriptedDelegationProvider(LLMProvider):
             if isinstance(item, dict)
         }
         tool_messages = [msg for msg in messages if msg.get("role") == "tool"]
-        latest_user_message = self._extract_latest_user_message(messages).lower()
+
+        if "request_user_decision" in tool_names:
+            return LLMResponse(content="Use the tools you have available.")
 
         if "delegate_project_task" in tool_names:
-            if "decision" in latest_user_message:
+            if "decision" in str(messages[-1].get("content") or "").lower():
                 if any(msg.get("name") == "delegate_project_task" for msg in tool_messages):
                     return LLMResponse(
                         content="Delegated module1 and waiting for a user decision before finishing the change.",
@@ -154,6 +156,7 @@ async def _consume_many_responses(
     chat_id: str,
     count: int,
     timeout: float = 1200.0,
+    predicate = None,
 ) -> list[OutboundMessage]:
     messages: list[OutboundMessage] = []
     loop = asyncio.get_running_loop()
@@ -161,7 +164,8 @@ async def _consume_many_responses(
     while len(messages) < count and loop.time() < deadline:
         message = await asyncio.wait_for(bus.consume_outbound(), timeout=max(0.1, deadline - loop.time()))
         if message.channel == channel and message.chat_id == chat_id:
-            messages.append(message)
+            if predicate is None or predicate(message):
+                messages.append(message)
     if len(messages) != count:
         raise AssertionError(f"Timed out waiting for {count} outbound messages; got {len(messages)}")
     return messages
@@ -235,33 +239,51 @@ async def test_core_manager_run_e2e_delegates_fixed_test_code_projects(tmp_path:
         for handle in manager._project_subprocesses.values():
             assert handle.process.returncode is None, f"Subprocess for {handle.project} exited"
 
-        await asyncio.sleep(2)
-        await asyncio.sleep(2)
-        await asyncio.sleep(2)
-        await asyncio.sleep(20)
-        await asyncio.sleep(10)
+        decision_messages = await _consume_many_responses(
+            bus,
+            channel="e2e",
+            chat_id="core-run-flow",
+            count=3,
+            timeout=90.0,
+            predicate=lambda message: str(message.metadata.get("type") or "") == "project_agent_decision_request",
+        )
+        for dm in decision_messages:
+            assert dm.metadata.get("project") in {"test_code/module1", "test_code/module2", "test_code/module3"}
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="e2e",
+                    sender_id="tester",
+                    chat_id="core-run-flow",
+                    content="rest",
+                    metadata={"project_decision_id": dm.metadata["project_decision_id"]},
+                )
+            )
+
         completion_messages = await _consume_many_responses(
             bus,
             channel="e2e",
             chat_id="core-run-flow",
             count=3,
-            timeout=30.0,
+            timeout=60.0,
+            predicate=lambda message: message.content.startswith("[Project Scope:"),
         )
         completion_content = "\n".join(message.content for message in completion_messages)
         assert "[Project Scope: test_code/module1]" in completion_content
         assert "[Project Scope: test_code/module2]" in completion_content
         assert "[Project Scope: test_code/module3]" in completion_content
         assert "MOCK_NETWORK_DATA: module1-service-status=healthy" in completion_content
+        assert "USER_DECISION: rest" in completion_content
 
         await asyncio.sleep(1)  # wait for the delegated file edits to be flushed
 
         for module_name, path in test_files.items():
             content = path.read_text(encoding="utf-8")
             assert f"def get_{module_name}_interface() -> str:" in content
-            assert f'return "{module_name}-interface"' in content
+            assert f'return "{module_name}-rest-interface"' in content
 
         module1_content = test_files["module1"].read_text(encoding="utf-8")
         assert "# MOCK_NETWORK_DATA: module1-service-status=healthy" in module1_content
+        assert "# USER_DECISION: rest" in module1_content
     except Exception as e:
         logger.error("\x1b[31m Test failed with exception: %s \x1b[0m", e)
         assert False, f"Test failed with exception: {e}"

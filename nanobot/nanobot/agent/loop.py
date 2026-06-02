@@ -56,6 +56,7 @@ class AgentLoop:
         agent_role: str = "main",
         scope_hint: str | None = None,
         enable_message_tool: bool = True,
+        request_decision_callback: Any = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.cron.service import CronService
@@ -71,6 +72,7 @@ class AgentLoop:
         self.agent_role = agent_role
         self.scope_hint = scope_hint
         self.enable_message_tool = enable_message_tool
+        self._request_decision_callback = request_decision_callback
 
         self.context = ContextBuilder(workspace, agent_role=agent_role, scope_hint=scope_hint)
         self.sessions = session_manager or SessionManager(workspace)
@@ -83,6 +85,7 @@ class AgentLoop:
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            request_decision_callback=request_decision_callback,
         )
 
         self._running = False
