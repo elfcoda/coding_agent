@@ -243,6 +243,7 @@ async def _process_single_request(
             )
         )
 
+        # 取最新的一条，也就是混合了所有tool和sub agent结果的那条消息，即最终task的返回
         result = await _collect_request_result(
             loop,
             channel=local_channel,
