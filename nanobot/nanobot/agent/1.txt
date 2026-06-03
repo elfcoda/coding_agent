@@ -1,3 +1,6 @@
 module 1 - spawn Spawning a helper to fetch mocked module1 network data.  - subagent system msg pass thought
 module 2 - 'request_user_decision', Need a user decision before editing {module_name} api.py.  edit file
 module 3 - 'request_user_decision', Need a user decision before editing {module_name} api.py.  edit file
+
+3层agent，以及不同agent间的通信，inbound和outbound以及整体流程，还有在core和project之间的流转，这些搞清楚就行了。其他细节不用care，不管了
+

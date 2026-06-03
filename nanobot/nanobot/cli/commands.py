@@ -8,6 +8,8 @@ from pathlib import Path
 import select
 import sys
 
+from litellm import uuid
+from tests.test_core_manager_run_e2e import ScriptedDelegationProvider
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
@@ -342,6 +344,137 @@ def gateway(
     from nanobot.heartbeat.service import HeartbeatService
     from nanobot.control_plane import create_control_plane_app
     import uvicorn
+    from nanobot.workflow import WorkflowStore
+
+    if verbose:
+        import logging
+        logging.basicConfig(level=logging.DEBUG)
+
+    console.print(f"{__logo__} Starting nanobot gateway on {host}:{port}...")
+
+    repo_root = Path(__file__).resolve().parents[3]
+    workflow_db = tmp_path / f"workflow_test_{uuid.uuid4().hex}.db"
+    workflow_store = WorkflowStore(workflow_db)
+
+    config = _load_cli_config(config_path)
+    bus = MessageBus()
+    provider = ScriptedDelegationProvider(repo_root)
+    session_manager = SessionManager(config.workspace_path)
+
+    # Create cron service first (callback set after agent creation)
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    cron = CronService(cron_store_path)
+
+    # Create core manager with cron service
+    agent = CoreAgentManager(
+        bus=bus,
+        provider=provider,
+        workspace=repo_root,
+        allowed_project_scopes=["test_code/module1", "test_code/module2", "test_code/module3"],
+        workflow_store=workflow_store,
+        decision_sla_seconds=3600,
+        decision_sla_block_scope="module",
+        decision_queue_impact_weight=10,
+        decision_queue_age_weight=1,
+        decision_default_degradation="wait",
+    )
+    # Use scripted provider in project subprocess workers (test mode)
+    agent._worker_provider_type = "scripted"
+
+    test_files = {
+        module_name: repo_root / "test_code" / module_name / "api.py"
+        for module_name in ("module1", "module2", "module3")
+    }
+    original_contents = {module_name: path.read_text(encoding="utf-8") for module_name, path in test_files.items()}
+
+
+    # Set cron callback (needs agent)
+    async def on_cron_job(job: CronJob) -> str | None:
+        """Execute a cron job through the agent."""
+        response = await agent.process_direct(
+            job.payload.message,
+            session_key=f"cron:{job.id}",
+            channel=job.payload.channel or "cli",
+            chat_id=job.payload.to or "direct",
+        )
+        if job.payload.deliver and job.payload.to:
+            from nanobot.bus.events import OutboundMessage
+            await bus.publish_outbound(OutboundMessage(
+                channel=job.payload.channel or "cli",
+                chat_id=job.payload.to,
+                content=response or ""
+            ))
+        return response
+    cron.on_job = on_cron_job
+
+    # Create heartbeat service
+    async def on_heartbeat(prompt: str) -> str:
+        """Execute heartbeat through the agent."""
+        return await agent.process_direct(prompt, session_key="heartbeat")
+
+    heartbeat = HeartbeatService(
+        workspace=config.workspace_path,
+        on_heartbeat=on_heartbeat,
+        interval_s=30 * 60,  # 30 minutes
+        enabled=True
+    )
+
+    # Create channel manager
+    channels = ChannelManager(config, bus, session_manager=session_manager)
+
+    if channels.enabled_channels:
+        console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
+    else:
+        console.print("[yellow]Warning: No channels enabled[/yellow]")
+
+    cron_status = cron.status()
+    if cron_status["jobs"] > 0:
+        console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
+
+    console.print(f"[green]✓[/green] Heartbeat: every 30m")
+    console.print(f"[green]✓[/green] Control plane: http://{host}:{port}/api/control/health")
+
+    control_plane_app = create_control_plane_app(agent, config.control_plane)
+    uvicorn_config = uvicorn.Config(control_plane_app, host=host, port=port, log_level="info")
+    control_plane_server = uvicorn.Server(uvicorn_config)
+
+    async def run():
+        try:
+            await cron.start()
+            await heartbeat.start()
+            await asyncio.gather(
+                agent.run(),
+                channels.start_all(), # ws
+                control_plane_server.serve(), # api
+            )
+        except KeyboardInterrupt:
+            console.print("\nShutting down...")
+            heartbeat.stop()
+            cron.stop()
+            agent.stop()
+            control_plane_server.should_exit = True
+            await channels.stop_all()
+
+    asyncio.run(run())
+
+@app.command()
+def gateway2(
+    port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
+    host: str = typer.Option("0.0.0.0", "--host", help="Gateway host"),
+    config_path: Path | None = typer.Option(None, "--config-path", help="Explicit config file path; defaults to ~/.nanobot/config.json"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+):
+    """Start the nanobot gateway."""
+    from nanobot.config.loader import load_config, get_data_dir
+    from nanobot.bus.queue import MessageBus
+    from nanobot.agent.core_manager import CoreAgentManager
+    from nanobot.channels.manager import ChannelManager
+    from nanobot.session.manager import SessionManager
+    from nanobot.cron.service import CronService
+    from nanobot.cron.types import CronJob
+    from nanobot.heartbeat.service import HeartbeatService
+    from nanobot.control_plane import create_control_plane_app
+    import uvicorn
 
     if verbose:
         import logging
@@ -452,7 +585,6 @@ def gateway(
             await channels.stop_all()
 
     asyncio.run(run())
-
 
 
 
