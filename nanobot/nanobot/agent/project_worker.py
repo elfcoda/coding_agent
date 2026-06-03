@@ -62,6 +62,7 @@ class _ScriptedProjectProvider:
         has_mock_network_data = self.MOCK_NETWORK_DATA in latest_user_message
         decision_choice = self._extract_tool_result(tool_messages, "request_user_decision")
 
+        # 垃圾ai写的一堆垃圾代码，乱死了
         if (
             module_name == "module1"
             and "need user decision" in latest_user_message.lower()
@@ -117,6 +118,19 @@ class _ScriptedProjectProvider:
                                 name="mock_network_fetch",
                                 arguments={"resource": "module1-service-status"},
                             )
+                            # ToolCallRequest(
+                            #     id=f"project-{module_name}",
+                            #     name="edit_file",
+                            #     arguments={
+                            #         "path": str(workspace / "api.py"),
+                            #         "old_text": "# ADD_INTERFACE_HERE",
+                            #         "new_text": (
+                            #             f"def get_{module_name}_interface() -> str:\n"
+                            #             f"    return \"{module_name}-interface\"\n\n"
+                            #             "# ADD_INTERFACE_HERE"
+                            #         ),
+                            #     },
+                            # )
                         ],
                     )
                 return LLMResponse(content=self.MOCK_NETWORK_DATA)
@@ -135,6 +149,19 @@ class _ScriptedProjectProvider:
                                 "label": "module1 network probe",
                             },
                         )
+                        # ToolCallRequest(
+                        #     id=f"project-{module_name}",
+                        #     name="edit_file",
+                        #     arguments={
+                        #         "path": str(workspace / "api.py"),
+                        #         "old_text": "# ADD_INTERFACE_HERE",
+                        #         "new_text": (
+                        #             f"def get_{module_name}_interface() -> str:\n"
+                        #             f"    return \"{module_name}-interface\"\n\n"
+                        #             "# ADD_INTERFACE_HERE"
+                        #         ),
+                        #     },
+                        # )
                     ],
                 )
             return LLMResponse(content="Waiting for mocked network data before editing module1 api.py.")
@@ -173,6 +200,19 @@ class _ScriptedProjectProvider:
                             arguments={
                                 "prompt": f"Choose the {module_name} interface style.",
                                 "options": ["rest", "graphql"],
+                            },
+                        ),
+                        ToolCallRequest(
+                            id=f"project-{module_name}",
+                            name="edit_file",
+                            arguments={
+                                "path": str(workspace / "api.py"),
+                                "old_text": "# ADD_INTERFACE_HERE",
+                                "new_text": (
+                                    f"def get_{module_name}_interface() -> str:\n"
+                                    f"    return \"{module_name}-interface\"\n\n"
+                                    "# ADD_INTERFACE_HERE"
+                                ),
                             },
                         )
                     ],
@@ -324,6 +364,10 @@ class _ProjectDecisionBridge:
         future.set_result(answer)
         return True
 
+    @property
+    def has_pending(self) -> bool:
+        return any(not future.done() for future in self._pending.values())
+
     def fail_all(self, reason: str) -> None:
         for future in list(self._pending.values()):
             if not future.done():
@@ -431,10 +475,13 @@ async def _process_single_request(
         )
 
         # 取最新的一条，也就是混合了所有tool和sub agent结果的那条消息，即最终task的返回
+        # 这里其实没有等subagent，输出直接给stdout了，不完整的，然后变成core的inbound的system略过，给outbound输出了。
+        # 所以后面subagent完成后被agent loop project消费了，那部分，也是发送system inbound给project，也被project过了，输出给project的bus的outbound，但是未被消费。
         result = await _collect_request_result(
             loop,
             channel=local_channel,
             chat_id=local_chat_id,
+            decision_bridge=decision_bridge,
         )
         return {"id": req_id, "success": True, "result": result}
     except asyncio.CancelledError:
@@ -451,10 +498,17 @@ async def _collect_request_result(
     *,
     channel: str,
     chat_id: str,
+    decision_bridge: _ProjectDecisionBridge | None = None,
     overall_timeout: float = 600.0,
     quiet_period: float = 2.0,
 ) -> str:
-    """Collect the latest outbound message for a request, allowing follow-up subagent results to arrive."""
+    """
+    Collect the latest outbound message for a request, allowing follow-up subagent results to arrive.
+
+    If there is a pending user decision (decision_bridge has unresolved futures), the collector
+    keeps waiting instead of returning the interim "decision required" message, ensuring the
+    final integrated result (after the user replies) is captured.
+    """
     event_loop = asyncio.get_running_loop()
     deadline = event_loop.time() + overall_timeout
     latest_content: str | None = None
@@ -468,6 +522,11 @@ async def _collect_request_result(
             continue
 
         latest_content = message.content
+
+        # If a decision is still pending, keep waiting – the agent is blocked.
+        if decision_bridge is not None and decision_bridge.has_pending:
+            continue
+
         quiet_deadline = min(deadline, event_loop.time() + quiet_period)
         while event_loop.time() < quiet_deadline:
             try:
@@ -541,7 +600,7 @@ async def _run_worker_loop(
                 break
 
             # wait random seconds to simulate variable processing time and increase chance of concurrent messages in tests (from 3s to 5s)
-            await asyncio.sleep(random.uniform(3, 5))
+            await asyncio.sleep(random.uniform(2, 3))
 
             response = await _process_single_request(loop, decision_bridge, request)
             writer.write(json.dumps(response, ensure_ascii=False) + "\n")

@@ -1,0 +1,3 @@
+module 1 - spawn Spawning a helper to fetch mocked module1 network data.  - subagent system msg pass thought
+module 2 - 'request_user_decision', Need a user decision before editing {module_name} api.py.  edit file
+module 3 - 'request_user_decision', Need a user decision before editing {module_name} api.py.  edit file
