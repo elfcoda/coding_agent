@@ -459,6 +459,7 @@ def gateway(
 
     asyncio.run(run())
 
+    console.print(f"[green]✓[/green] okay, nanobot has stopped. Restoring test files...")
 
 
 @app.command()
