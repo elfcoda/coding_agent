@@ -353,7 +353,9 @@ def gateway(
     console.print(f"{__logo__} Starting nanobot gateway on {host}:{port}...")
 
     repo_root = Path(__file__).resolve().parents[3]
-    workflow_db = tmp_path / f"workflow_test_{uuid.uuid4().hex}.db"
+    workflow_dir = get_data_dir() / "workflow"
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    workflow_db = workflow_dir / f"gateway_{uuid.uuid4().hex[:8]}.db"
     workflow_store = WorkflowStore(workflow_db)
 
     config = _load_cli_config(config_path)
@@ -456,6 +458,8 @@ def gateway(
             await channels.stop_all()
 
     asyncio.run(run())
+
+
 
 @app.command()
 def gateway2(

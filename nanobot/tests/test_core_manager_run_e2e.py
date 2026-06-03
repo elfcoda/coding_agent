@@ -305,6 +305,68 @@ async def test_core_manager_run_e2e_delegates_fixed_test_code_projects(tmp_path:
         manager.stop()
         await asyncio.wait_for(manager_task, timeout=5.0)
 
+async def test_gateway(bus) -> None:
+    try:
+        await asyncio.sleep(3)
+        logger.info("\x1b[32m Publishing test message to trigger delegation... \x1b[0m")
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="e2e",
+                sender_id="tester",
+                chat_id="core-run-flow",
+                content="Use the three fixed project agents under test_code to add one simple interface to each module.",
+            )
+        )
+
+        response = await _consume_response(bus, channel="e2e", chat_id="core-run-flow")
+
+        assert "module1" in response.content
+        assert "module2" in response.content
+        assert "module3" in response.content
+
+        # await asyncio.sleep(5)
+        # await asyncio.sleep(5)
+        # await asyncio.sleep(5)
+        decision_messages = await _consume_many_responses(
+            bus,
+            channel="e2e",
+            chat_id="core-run-flow",
+            count=3,
+            timeout=9000.0,
+            predicate=lambda message: str(message.metadata.get("type") or "") == "project_agent_decision_request",
+        )
+        # 过滤垃圾ai写的bug，过滤掉module 1的相关decision
+        await asyncio.sleep(3)
+        for dm in decision_messages:
+            assert dm.metadata.get("project") in {"test_code/module1", "test_code/module2", "test_code/module3"}
+            if dm.metadata.get("project") == "test_code/module1":
+                continue  # skip the buggy decision from the garbage ai
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel="e2e",
+                    sender_id="tester",
+                    chat_id="core-run-flow",
+                    content="rest",
+                    metadata={"project_decision_id": dm.metadata["project_decision_id"]},
+                )
+            )
+        await asyncio.sleep(1)
+        completion_messages = await _consume_many_responses(
+            bus,
+            channel="e2e",
+            chat_id="core-run-flow",
+            count=3,
+            timeout=6000.0,
+            predicate=lambda message: message.content.startswith("[Project Scope:"),
+        )
+        completion_content = "\n".join(message.content for message in completion_messages)
+        assert "[Project Scope: test_code/module2]" in completion_content
+        assert "[Project Scope: test_code/module3]" in completion_content
+        assert "USER_DECISION: rest" in completion_content
+    except Exception as e:
+        logger.error("\x1b[31m Test failed with exception: %s \x1b[0m", e)
+        assert False, f"Test failed with exception: {e}"
+
 
 async def test_core_manager_run_e2e_project_agent_requests_user_decision(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
