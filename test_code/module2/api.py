@@ -8,4 +8,7 @@ def existing_module2_value() -> str:
 def get_module2_interface() -> str:
     return "module2-interface"
 
+def get_module2_interface() -> str:
+    return "module2-interface"
+
 # ADD_INTERFACE_HERE

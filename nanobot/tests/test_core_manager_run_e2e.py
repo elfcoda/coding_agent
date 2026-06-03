@@ -270,12 +270,12 @@ async def test_core_manager_run_e2e_delegates_fixed_test_code_projects(tmp_path:
                     metadata={"project_decision_id": dm.metadata["project_decision_id"]},
                 )
             )
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
         completion_messages = await _consume_many_responses(
             bus,
             channel="e2e",
             chat_id="core-run-flow",
-            count=2,
+            count=3,
             timeout=6000.0,
             predicate=lambda message: message.content.startswith("[Project Scope:"),
         )
