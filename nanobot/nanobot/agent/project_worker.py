@@ -600,7 +600,7 @@ async def _run_worker_loop(
                 break
 
             # wait random seconds to simulate variable processing time and increase chance of concurrent messages in tests (from 3s to 5s)
-            await asyncio.sleep(random.uniform(2, 3))
+            await asyncio.sleep(random.uniform(3, 15))
 
             response = await _process_single_request(loop, decision_bridge, request)
             writer.write(json.dumps(response, ensure_ascii=False) + "\n")

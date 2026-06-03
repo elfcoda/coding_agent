@@ -14,4 +14,7 @@ def get_module2_interface() -> str:
 def get_module2_interface() -> str:
     return "module2-interface"
 
+def get_module2_interface() -> str:
+    return "module2-interface"
+
 # ADD_INTERFACE_HERE
