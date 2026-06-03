@@ -449,3 +449,92 @@ async def test_core_manager_run_e2e_project_agent_requests_user_decision(tmp_pat
         test_file.write_text(original_content, encoding="utf-8")
         manager.stop()
         await asyncio.wait_for(manager_task, timeout=5.0)
+
+
+async def test_ws_gateway_inbound(tmp_path: Path) -> None:
+    """Minimal test: connect to gateway WS, send an inbound message, verify it reaches the bus."""
+    import websockets
+    import json as json_module
+
+    repo_root = Path(__file__).resolve().parents[2]
+    workflow_db = tmp_path / f"ws_test_{uuid.uuid4().hex}.db"
+    workflow_store = WorkflowStore(workflow_db)
+    bus = MessageBus()
+    provider = ScriptedDelegationProvider(repo_root)
+
+    manager = CoreAgentManager(
+        bus=bus,
+        provider=provider,
+        workspace=repo_root,
+        allowed_project_scopes=["test_code/module1"],
+        workflow_store=workflow_store,
+        decision_sla_seconds=3600,
+        decision_sla_block_scope="module",
+        decision_queue_impact_weight=10,
+        decision_queue_age_weight=1,
+        decision_default_degradation="wait",
+    )
+    manager._worker_provider_type = "scripted"
+
+    from nanobot.channels.workflow_ws import WorkflowWSChannel
+    from nanobot.config.schema import WorkflowWSConfig
+
+    ws_config = WorkflowWSConfig(enabled=True, host="127.0.0.1", port=0)  # port=0 -> OS assigns
+    ws_channel = WorkflowWSChannel(ws_config, bus)
+
+    manager_task = asyncio.create_task(manager.run())
+    ws_task = asyncio.create_task(ws_channel.start())
+    await asyncio.sleep(2)
+
+    # 获取实际分配的端口 (port=0 时 OS 自动分配)
+    server_obj = getattr(ws_channel, "_server", None)
+    assert server_obj is not None, "WebSocket server not started"
+    actual_port: int = 0
+    for s in server_obj.sockets:
+        try:
+            actual_port = s.getsockname()[1]
+            break
+        except Exception:
+            pass
+    assert actual_port, f"Could not determine WebSocket port from {server_obj}"
+
+    ws_url = f"ws://127.0.0.1:{actual_port}/workflow"
+    logger.info("Connecting to WS at %s", ws_url)
+
+    try:
+        # 1) 连接 WS
+        async with websockets.connect(ws_url) as ws:
+            # 2) 收 connected 消息
+            connected_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+            connected = json_module.loads(connected_raw)
+            assert connected["type"] == "workflow.connected"
+            logger.info("Connected: cursor=%s", connected["payload"].get("latest_cursor"))
+
+            # 3) 发送 inbound 消息（模拟前端提交决策回复）
+            test_content = "rest"
+            test_decision_id = f"test-decision-{uuid.uuid4().hex[:8]}"
+            await ws.send(json_module.dumps({
+                "type": "inbound",
+                "content": test_content,
+                "metadata": {"project_decision_id": test_decision_id},
+            }))
+
+            # 4) 收 ack
+            ack_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+            ack = json_module.loads(ack_raw)
+            assert ack["type"] == "workflow.inbound.ack"
+            assert ack["payload"]["ok"] is True
+            assert ack["payload"]["char_len"] == len(test_content)
+            logger.info("Inbound ack received: ok=%s", ack["payload"]["ok"])
+
+        # 5) 从 bus 中消费这条 inbound 消息（验证它确实进了 bus）
+        inbound_msg = await asyncio.wait_for(bus.consume_inbound(), timeout=5.0)
+        assert inbound_msg.content == test_content
+        assert inbound_msg.metadata.get("project_decision_id") == test_decision_id
+        logger.info("Inbound message consumed from bus: content=%s", inbound_msg.content)
+
+        logger.info("\x1b[32m WS gateway inbound test PASSED \x1b[0m")
+    finally:
+        manager.stop()
+        ws_channel.stop()
+        await asyncio.wait_for(asyncio.gather(manager_task, ws_task, return_exceptions=True), timeout=5.0)

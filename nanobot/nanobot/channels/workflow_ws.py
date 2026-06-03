@@ -11,7 +11,7 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import WorkflowWSConfig
@@ -165,8 +165,30 @@ class WorkflowWSChannel(BaseChannel):
             return
 
         kind = str(command.get("type") or "").strip().lower()
+
         if kind == "ping":
             await websocket.send(json.dumps({"type": "pong", "payload": {"ts": datetime.utcnow().isoformat() + "Z"}}))
+            return
+
+        if kind in ("inbound", "publish"):
+            """前端通过 WS 发送消息回 bus，由 core manager 处理。"""
+            payload = command.get("payload", {})
+            content = str(payload.get("content") or command.get("content") or "")
+            metadata = dict(payload.get("metadata") or command.get("metadata") or {})
+            channel = str(payload.get("channel") or command.get("channel") or "workflow")
+            sender_id = str(payload.get("sender_id") or command.get("sender_id") or "ws_client")
+            chat_id = str(payload.get("chat_id") or command.get("chat_id") or f"ws:{id(websocket)}")
+            await self.bus.publish_inbound(InboundMessage(
+                channel=channel,
+                sender_id=sender_id,
+                chat_id=chat_id,
+                content=content,
+                metadata=metadata,
+            ))
+            await websocket.send(json.dumps({
+                "type": "workflow.inbound.ack",
+                "payload": {"ok": True, "channel": channel, "char_len": len(content)},
+            }))
             return
 
         if kind == "subscribe":
