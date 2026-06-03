@@ -3368,7 +3368,7 @@ class CoreAgentManager:
     async def run(self) -> None:
         """Run the core agent loop against the shared message bus."""
         logger = __import__("loguru").logger
-        await self._start_reconciler()
+        # await self._start_reconciler()
         self.core_loop._running = True
         logger.info("Agent loop started")
         try:

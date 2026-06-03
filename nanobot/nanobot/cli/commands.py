@@ -443,7 +443,7 @@ def gateway(
     async def run():
         try:
             await cron.start()
-            await heartbeat.start()
+            # await heartbeat.start()
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(), # ws
@@ -451,7 +451,7 @@ def gateway(
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
-            heartbeat.stop()
+            # heartbeat.stop()
             cron.stop()
             agent.stop()
             control_plane_server.should_exit = True
