@@ -36,7 +36,26 @@ async def fin():
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=3600.0)
                 msg = json.loads(raw)
-                logger.info("msg: %s", json.dumps(msg, indent=2, ensure_ascii=False))
+                payload = msg.get("payload")
+                project = msg.get("project")
+                metadata_type = msg.get("metadata_type")
+                project_decision_id = msg.get("project_decision_id")
+                print("Event content:", payload)
+                print("Event project:", project)
+                # print("Event metadata_type:", metadata_type)
+                # print("Event project_decision_id:", project_decision_id)
+
+                if metadata_type == "project_agent_decision_request":
+                    if project == "test_code/module2" or project == "test_code/module3":
+                        await ws.send(json.dumps({
+                            "type": "inbound",
+                            "channel": "e2e",
+                            "sender_id": "tester",
+                            "chat_id": "core-run-flow",
+                            "content": "rest",
+                            "metadata": {"project_decision_id": project_decision_id}
+                        }))
+
             except asyncio.TimeoutError:
                 logger.warning("No events for 1h, keeping connection alive...")
             except websockets.ConnectionClosed:

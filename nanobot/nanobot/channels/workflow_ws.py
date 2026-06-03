@@ -97,6 +97,9 @@ class WorkflowWSChannel(BaseChannel):
             "event_id": f"wf-{datetime.utcnow().timestamp():.6f}",
             "ts": datetime.utcnow().isoformat() + "Z",
             "type": event_type,
+            "project": msg.metadata.get("project"),
+            "metadata_type": msg.metadata.get("type", "unknown type"),
+            "project_decision_id": msg.metadata.get("project_decision_id", "0_decision"),
             "payload": payload.get("payload", payload),
         }
 
