@@ -46,4 +46,10 @@ def get_module1_interface() -> str:
 def get_module1_interface() -> str:
     return "module1-interface"
 
+def get_module1_interface() -> str:
+    return "module1-interface"
+
+def get_module1_interface() -> str:
+    return "module1-interface"
+
 # ADD_INTERFACE_HERE

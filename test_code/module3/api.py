@@ -14,4 +14,13 @@ def get_module3_interface() -> str:
 def get_module3_interface() -> str:
     return "module3-interface"
 
+def get_module3_interface() -> str:
+    return "module3-interface"
+
+def get_module3_interface() -> str:
+    return "module3-interface"
+
+def get_module3_interface() -> str:
+    return "module3-interface"
+
 # ADD_INTERFACE_HERE
