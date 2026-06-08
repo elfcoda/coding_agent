@@ -2650,6 +2650,7 @@ class CoreAgentManager:
     def set_project_runtime_attributes(self, project: str, attributes: dict[str, Any]) -> dict[str, Any]:
         """Set runtime control attributes for one project scope."""
         normalized, _ = self._normalize_project(project)
+
         next_attributes = dict(attributes or {})
         self._project_runtime_attributes[normalized] = next_attributes
         self._emit_workflow_event(
@@ -2659,6 +2660,8 @@ class CoreAgentManager:
                 "attributes": next_attributes,
             },
         )
+        # log next_attributes
+        print("Updated runtime attributes for project, ", normalized, "attributes, ", next_attributes)
         return next_attributes
 
     def get_project_runtime_attributes(self, project: str) -> dict[str, Any]:

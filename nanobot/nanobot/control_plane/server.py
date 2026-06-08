@@ -10,6 +10,7 @@ from collections import deque
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -134,9 +135,19 @@ def create_control_plane_app(
         description="Demo control plane for multi-agent orchestration",
     )
 
+    # CORS — allow all origins for browser-based UIs
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     @app.middleware("http")
     async def guard_control_plane(request: Request, call_next):
-        if request.url.path == "/api/control/health":
+        # Allow CORS preflight and health check without auth
+        if request.method == "OPTIONS" or request.url.path == "/api/control/health":
             return await call_next(request)
 
         if require_api_key:
@@ -495,6 +506,11 @@ def create_control_plane_app(
 
     @app.put("/api/control/projects/{project}/attributes")
     async def set_project_attributes(project: str, request: ProjectAttributesRequest) -> dict[str, Any]:
+        # 把project里的第2个_替换成/
+        parts = project.split("_", 2)
+        if len(parts) == 3:
+            project = f"{parts[0]}_{parts[1]}/{parts[2]}"
+        print(f"Received command to set attributes for project {project}: {request.attributes}")
         try:
             updated = manager.set_project_runtime_attributes(project, request.attributes)
             return {
@@ -507,6 +523,11 @@ def create_control_plane_app(
 
     @app.put("/api/control/commands/projects/{project}/attributes")
     async def command_set_project_attributes(project: str, request: ProjectAttributesRequest) -> dict[str, Any]:
+        # 把project里的第2个_替换成/
+        parts = project.split("_", 2)
+        if len(parts) == 3:
+            project = f"{parts[0]}_{parts[1]}/{parts[2]}"
+        print(f"Received command to set attributes for project {project}: {request.attributes}")
         try:
             updated = manager.set_project_runtime_attributes(project, request.attributes)
             return {
