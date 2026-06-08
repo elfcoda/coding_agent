@@ -254,6 +254,14 @@ def create_control_plane_app(
             **payload,
         }
 
+    @app.get("/api/control/project-workers/status")
+    async def project_workers_status() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "generated_at": _now_utc_iso(),
+            **manager.get_project_workers_status(),
+        }
+
     @app.get("/api/control/decisions/queue")
     async def decision_queue(limit: int = 200) -> dict[str, Any]:
         safe_limit = max(1, min(limit, 1000))

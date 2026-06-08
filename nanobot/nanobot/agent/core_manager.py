@@ -2666,6 +2666,31 @@ class CoreAgentManager:
         normalized, _ = self._normalize_project(project)
         return dict(self._project_runtime_attributes.get(normalized, {}))
 
+    def get_project_workers_status(self) -> dict[str, Any]:
+        """Query project worker subprocesses status and decision blocking state.
+
+        Returns:
+            dict with:
+              - projects: dict of project -> pending_request_count
+              - total_pending_requests: int
+              - decision_blocked: dict with blocked_modules and global_blocked
+        """
+        projects: dict[str, int] = {}
+        total_pending = 0
+        for project, handle in self._project_subprocesses.items():
+            count = len(handle.pending_requests)
+            projects[project] = count
+            total_pending += count
+
+        return {
+            "projects": projects,
+            "total_pending_requests": total_pending,
+            "decision_blocked": {
+                "blocked_modules": sorted(self._decision_sla_blocked_modules),
+                "global_blocked": self._decision_sla_global_block,
+            },
+        }
+
     def _project_scheduler_profile(self, project: str) -> dict[str, Any]:
         """Normalize project runtime attributes into scheduler controls."""
         normalized, _ = self._normalize_project(project)

@@ -27,7 +27,7 @@ class WorkflowWSChannel(BaseChannel):
 
     name = "workflow"
 
-    def __init__(self, config: WorkflowWSConfig, bus: MessageBus):
+    def __init__(self, config: WorkflowWSConfig, bus: MessageBus, status_provider: Any = None):
         super().__init__(config, bus)
         self.config: WorkflowWSConfig = config
         self._server: Any = None
@@ -38,6 +38,12 @@ class WorkflowWSChannel(BaseChannel):
         self._event_cursor = 0
         max_events = max(100, int(self.config.replay_buffer_size))
         self._event_buffer: deque[dict[str, Any]] = deque(maxlen=max_events)
+        self._status_provider: Any = None
+        self._client_status_tasks: dict[Any, asyncio.Task[None]] = {}
+
+    def set_status_provider(self, provider: Any) -> None:
+        """Set a callable that returns project workers status dict for periodic push."""
+        self._status_provider = provider
 
     async def start(self) -> None:
         """Start workflow WebSocket server and keep serving until stopped."""
@@ -66,6 +72,11 @@ class WorkflowWSChannel(BaseChannel):
         """Stop workflow WebSocket server and disconnect clients."""
         self._running = False
         self._stop_event.set()
+
+        # Cancel all per-client status push tasks
+        for websocket, task in list(self._client_status_tasks.items()):
+            task.cancel()
+        self._client_status_tasks.clear()
 
         async with self._clients_lock:
             clients = list(self._clients.keys())
@@ -136,6 +147,14 @@ class WorkflowWSChannel(BaseChannel):
         async with self._clients_lock:
             self._clients[websocket] = _ClientSubscription(event_types=set())
 
+        # Start periodic status push for this client if a provider is set
+        status_task: asyncio.Task[None] | None = None
+        if self._status_provider is not None:
+            status_task = asyncio.create_task(
+                self._periodic_status_push(websocket)
+            )
+            self._client_status_tasks[websocket] = status_task
+
         try:
             await websocket.send(
                 json.dumps(
@@ -156,6 +175,10 @@ class WorkflowWSChannel(BaseChannel):
         except Exception:
             pass
         finally:
+            # Cancel the per-client status push task
+            if status_task is not None:
+                status_task.cancel()
+                self._client_status_tasks.pop(websocket, None)
             async with self._clients_lock:
                 self._clients.pop(websocket, None)
 
@@ -277,3 +300,29 @@ class WorkflowWSChannel(BaseChannel):
             await websocket.send(json.dumps(envelope, ensure_ascii=False))
             sent += 1
         return sent
+
+    async def _periodic_status_push(self, websocket: Any) -> None:
+        """Periodically push project workers status to one connected client every 0.3s."""
+        try:
+            while self._running:
+                await asyncio.sleep(0.3)
+                if not self._running:
+                    break
+                try:
+                    status = self._status_provider()
+                    body = json.dumps(
+                        {
+                            "type": "workflow.status.push",
+                            "ts": datetime.utcnow().isoformat() + "Z",
+                            "payload": status,
+                        },
+                        ensure_ascii=False,
+                    )
+                    await websocket.send(body)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Client likely disconnected; stop the task
+                    break
+        except asyncio.CancelledError:
+            pass

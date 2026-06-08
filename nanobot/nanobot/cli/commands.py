@@ -424,6 +424,11 @@ def gateway(
     # Create channel manager
     channels = ChannelManager(config, bus, session_manager=session_manager)
 
+    # Wire periodic status push to WebSocket clients
+    ws_channel = channels.channels.get("workflow")
+    if ws_channel is not None:
+        ws_channel.set_status_provider(agent.get_project_workers_status)
+
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
