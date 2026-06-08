@@ -305,7 +305,7 @@ class WorkflowWSChannel(BaseChannel):
         """Periodically push project workers status to one connected client every 0.3s."""
         try:
             while self._running:
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.9)
                 if not self._running:
                     break
                 try:

@@ -164,7 +164,7 @@ class _ScriptedProjectProvider:
                         # )
                     ],
                 )
-            return LLMResponse(content="Waiting for mocked network data before editing module1 api.py.")
+            return LLMResponse(content="Already used mocked network data to edit module1 api.py.") # 这里应该是未完成的状态本来
 
         if "request_user_decision" in tool_names and "edit_file" in tool_names:
             decision_choice = self._extract_tool_result(tool_messages, "request_user_decision")
